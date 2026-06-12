@@ -284,6 +284,21 @@ pub mod llm {
     /// Enable the experimental Anthropic Messages API endpoint (/v1/messages)
     pub const DYN_ENABLE_ANTHROPIC_API: &str = "DYN_ENABLE_ANTHROPIC_API";
 
+    /// Master switch for the `nvext` extension protocol on the frontend.
+    /// Default `true`. Falsy values (`0` / `false` / `no` / `off`,
+    /// case-insensitive) cause the frontend to drop `request.nvext` at
+    /// handler entry, ignore the routing-override headers
+    /// (`x-worker-instance-id`, `x-prefill-instance-id`, `x-dp-rank`,
+    /// `x-prefill-dp-rank`), and silently ignore the response-side
+    /// `extra_fields` opt-in.
+    pub const DYN_ENABLE_FRONTEND_NVEXT: &str = "DYN_ENABLE_FRONTEND_NVEXT";
+
+    /// Master switch for the frontend's HTTP admin API surface.
+    /// Default `true`. Falsy values prevent registration of `GET` /
+    /// `POST /busy_threshold`. Inference, metrics, models, health, and
+    /// liveness routes are unaffected.
+    pub const DYN_ENABLE_FRONTEND_ADMIN_API: &str = "DYN_ENABLE_FRONTEND_ADMIN_API";
+
     /// Strip the Claude Code billing preamble (`x-anthropic-billing-header: ...`)
     /// from the system prompt before forwarding to the target model. The preamble
     /// varies per session and per release, wasting tokens and breaking prompt caching.
@@ -295,16 +310,6 @@ pub mod llm {
     /// Enable streaming reasoning dispatch (`event: reasoning_dispatch` SSE events)
     pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str =
         "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
-
-    /// Enable parser debug mode (off by default). When enabled, the frontend emits
-    /// one structured tracing event per choice at stream end pairing the RAW model
-    /// completion text with the parsed result (reasoning_content / content /
-    /// tool_calls / finish_reason), so intermittent parse failures can be diagnosed
-    /// from logs (queryable under `DYN_LOGGING_JSONL=true`) instead of hand-captured.
-    ///
-    /// WARNING: raw completions carry user data — this is opt-in only. Unset / `0` /
-    /// `false` = off; any other value = on.
-    pub const DYN_PARSER_DEBUG: &str = "DYN_PARSER_DEBUG";
 
     /// Backend stream inactivity timeout in seconds.
     ///
