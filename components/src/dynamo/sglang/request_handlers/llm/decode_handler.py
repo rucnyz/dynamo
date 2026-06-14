@@ -297,6 +297,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         # Keep max_new_tokens even when None — SGLang treats None as "generate
         # until EOS/context-length" whereas omitting it triggers a default of 128.
+        # aginfer: forced_output_ids (teacher-forcing for faithful replay) is carried
+        # in extra_args because the request plane strips unknown keys from
+        # sampling_options; recover it into custom_params for sglang's forcing sampler.
+        _ea = request.get("extra_args") or {}
+        _forced = _ea.get("forced_output_ids") if isinstance(_ea, dict) else None
+        if _forced and not param_mapping.get("custom_params"):
+            param_mapping["custom_params"] = {"forced_output_ids": _forced}
         keep_if_none = {"max_new_tokens"}
         return {
             k: v for k, v in param_mapping.items() if v is not None or k in keep_if_none
