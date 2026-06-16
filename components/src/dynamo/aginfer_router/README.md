@@ -60,3 +60,37 @@ value-eviction lever stays engine-side (sglang scorer), forwarded via the priori
 
 Derived from `dynamo.thunderagent_router` (Apache-2.0, NVIDIA) — the pause/resume/BFD
 machinery is theirs; the value gate (`_program_value` + the ordering swaps) is aginfer's.
+
+---
+
+## #251 step 5 — value-aware admission (engine-state ingestion)
+
+The verified #251 split puts MIGRATION in the engine and ADMISSION (pause/resume) HERE at the
+router. Today this router's pause decision uses a token-size proxy (`_program_value`); step 5
+makes it value-aware by reading the engine's real value state — **reusing the in-engine
+`build_paper_state` + `admission_controller` directly** (the router runs with the sglang fork on
+its PYTHONPATH; single source, no copy). Confirmed feasible: the router CAN import
+`sglang.srt.mem_cache.aginfer.{state_builder,admission_controller}`.
+
+Ordered plan (foundation → live-path; the high-risk steps need a stabilized sglang-backed stack):
+1. **`engine_state.py` — DONE (increment 1, 10 server-free tests).** Async GET `/aginfer/state`
+   → the engine's real `SchedulerState` via in-engine `build_paper_state` (synthetic
+   MEMORY_PRESSURE event). DO-NO-HARM: `None` when no `--aginfer-state-url` / unreachable /
+   non-sglang backend ⇒ router falls back to the size proxy. Tick-cached (NOT per-request — the
+   dump is 5-50ms, #160).
+2. wire a `--aginfer-state-url` arg (`args.py`) + a tick-driven snapshot refresh in the scheduler
+   loop (the cached `SchedulerState`).
+3. swap `_program_value` → in-engine `admission_controller.shared_aware_prog_scores` (fleet,
+   holder-split) when state present; size proxy when absent. Replace watermark pause-victim
+   selection with `pause_candidates` (cost vs shadow-price `pause_relief`). **high risk.**
+4. gate the ingress `asyncio.Event` on the engine's `per_program_usage[pid].state == PAUSED`
+   (not just router-local lifecycle); port `_gated_count` + resume-in-flight dedup (#215) +
+   ended-while-gated 499 (#183). **high risk — distributed state authority / lag.**
+5. SESSION_END / disconnect on the gate; expose theta_hi/lo/heartbeat for `capacity_fits`/`forecast`.
+
+Hard problems (see the step-5 map): backend must be sglang (vLLM has no `/aginfer/state`);
+router↔engine state-lag authority (avoid double-pause/strand); `pause_relief` needs the engine's
+D_t (conservative `exclude={}` until plumbed); pause-thrash on stale state (regime-dependent win,
+do-no-harm floor is not) ⇒ the value path must be provably no-worse-than the size baseline when
+state is stale/absent. Live goodput-vs-ThunderAgent A/B (moderate concurrency, N≥3 paired) runs
+only after the unit layer is green AND on a stabilized stack (V4 is crash-prone under flood).
