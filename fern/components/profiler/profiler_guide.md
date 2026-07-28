@@ -59,7 +59,7 @@ Each DGDR requires a container image for profiling and deployment:
 
 ```yaml
 spec:
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"
 ```
 
 #### Quick Start: Deploy with DGDR
@@ -76,7 +76,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"
 
   workload:
     isl: 3000
@@ -222,7 +222,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"
 
   workload: { ... }
   sla: { ... }
@@ -488,14 +488,14 @@ SGLang workers expose profiling endpoints for runtime performance analysis:
 
 ```bash
 # Start profiling
-curl -X POST http://localhost:9090/engine/start_profile \
+curl -X POST http://localhost:9090/engine/control/start_profile \
   -H "Content-Type: application/json" \
   -d '{"output_dir": "/tmp/profiler_output"}'
 
 # Run inference requests...
 
 # Stop profiling
-curl -X POST http://localhost:9090/engine/stop_profile
+curl -X POST http://localhost:9090/engine/control/stop_profile
 ```
 
 View traces using Chrome's `chrome://tracing`, [Perfetto UI](https://ui.perfetto.dev/), or TensorBoard.
@@ -586,6 +586,6 @@ kubectl create secret docker-registry nvcr-imagepullsecret \
 
 ## See Also
 
-- [DGDR Examples](../../../docs/components/profiler/profiler-examples.md) - Complete DGDR YAML examples
-- [DGDR API Reference](/docs/kubernetes/api-reference.md) - DGDR specification
+- [DGDR Examples](./profiler-examples.md) - Complete DGDR YAML examples
+- [DGDR API Reference](../../kubernetes/api-reference.md) - DGDR specification
 - [Profiler Arguments Reference](https://github.com/ai-dynamo/dynamo/blob/main/components/src/dynamo/profiler/utils/dgdr_v1beta1_types.py) - Full Configuration Reference

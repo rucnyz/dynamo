@@ -7,7 +7,7 @@ subtitle: Build Dynamo runtime images for built-in or custom backends
 
 Dynamo runtime images package the Dynamo runtime with an inference engine. The same container build flow can generate images for the built-in engines or a backend that you add on top of the Dynamo runtime.
 
-Use [`container/render.py`](../../container/render.py) to select the engine family and Docker target:
+Use [`container/render.py`](https://github.com/ai-dynamo/dynamo/blob/main/container/render.py) to select the engine family and Docker target:
 
 ```bash
 # vLLM runtime image
@@ -58,7 +58,7 @@ ENTRYPOINT ["my-backend"]
 For a Rust custom backend, build the backend binary in your own builder stage and copy it into the Dynamo runtime image:
 
 ```Dockerfile
-FROM rust:1.93 AS backend-builder
+FROM rust:1.96.1 AS backend-builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release
@@ -77,4 +77,4 @@ Use `container/run.sh` to launch the image with the same GPU and mount defaults 
 container/run.sh --image dynamo:custom-backend-base --mount-workspace -it
 ```
 
-For the full container build reference, target matrix, and troubleshooting notes, see the repository-level [Container Development Guide](../../container/README.md).
+For the full container build reference, target matrix, and troubleshooting notes, see the repository-level [Container Development Guide](https://github.com/ai-dynamo/dynamo/blob/main/container/README.md).

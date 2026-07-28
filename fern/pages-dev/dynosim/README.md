@@ -1,5 +1,5 @@
 ---
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: DynoSim
 subtitle: Simulate Dynamo deployment choices before spending GPU time
@@ -25,6 +25,21 @@ Use DynoSim when you want to answer questions such as:
 | AIC | AI Configurator SDK | Supplies calibrated timing and candidate-shape data for supported model/backend/GPU tuples |
 | Planner simulation | `--planner-config` on DynoSim runs | Runs Planner decisions in the simulation loop to study scaling behavior and SLA compliance |
 
+## How the tools differ
+
+The tools overlap in workflow but perform different jobs:
+
+| Tool | Function | What it does not do |
+|---|---|---|
+| AIConfigurator | Estimates performance and ranks parallelism and deployment layouts | Does not run the Dynamo request lifecycle or measure a live endpoint |
+| Mocker | Simulates engine scheduling, KV-cache state, timing, and worker behavior | Does not execute model inference on GPUs |
+| DynoSim | Replays workloads and sweeps configurations using Mocker engine cores | Does not replace final validation on the target deployment |
+| AIPerf | Sends load to a live OpenAI-compatible endpoint and measures the result | Does not predict or simulate an undeployed configuration |
+
+DynoSim can use AIConfigurator predictions as the forward-pass timing model inside Mocker. In that
+combination, AIConfigurator estimates how long model work takes, while Mocker and DynoSim simulate
+how requests move through scheduling, KV-cache, routing, and Planner behavior.
+
 ## Workflow
 
 ```mermaid
@@ -47,10 +62,11 @@ AIC provides performance models and candidate-shape information. DynoSim uses th
 
 | Goal | Start Here |
 |---|---|
-| Run one trace or synthetic workload through one config | [DynoSim Runs](runs.md) |
-| Sweep topology and router choices under SLA/GPU constraints | [DynoSim Sweeps](sweeps.md) |
-| Exercise a live frontend/router setup without GPUs | [Live Simulation with Mocker](mocker.md) |
-| Study Planner scaling decisions against a trace | [Planner DynoSim Benchmarking](planner-benchmarking.md) |
+| Run one trace or synthetic workload through one config | [Run a DynoSim Simulation](runs.mdx) |
+| Sweep topology and router choices under SLA/GPU constraints | [Sweep DynoSim Configurations](sweeps.mdx) |
+| Exercise a Kubernetes frontend/router setup without GPUs | [Simulate a Kubernetes Deployment](mocker.mdx) |
+| Exercise a local frontend/router setup without GPUs | [Simulate a Local Deployment](mocker-local.mdx) |
+| Study Planner scaling decisions against a trace | [Benchmark Planner Decisions](planner-benchmarking.mdx) |
 | Generate a deployable Kubernetes config from model/SLA intent | [Model Deployment Guide](../kubernetes/model-deployment-guide.md) |
 
 DynoSim narrows the search space; it does not replace real-hardware validation. Use it to move quickly, find promising candidates, and understand failure modes before spending cluster time.

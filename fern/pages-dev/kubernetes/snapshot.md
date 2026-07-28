@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Snapshotting GPU Workers
+subtitle: Checkpoints initialized GPU workers with CRIU and cuda-checkpoint so later pods warm-start in seconds instead of minutes.
 ---
 
 > ⚠️ **Experimental Feature**: Dynamo Snapshot is currently in preview and may only be functional in some cluster setups. The `snapshot-agent` DaemonSet runs in privileged mode to perform CRIU operations. See [Limitations](#limitations) for details.
@@ -26,7 +27,8 @@ For more background on the snapshot architecture and startup improvements, see
 
 - x86_64 (`amd64`) GPU nodes
 - NVIDIA driver 580.xx or newer on the target GPU nodes (590.xx or newer if testing multi-GPU snapshots)
-- vLLM or SGLang backend today
+- vLLM or SGLang backend today; TensorRT-LLM is supported only for the
+  experimental single-GPU aggregated text worker path.
 - Checkpoint storage. `ReadWriteMany` is the safest default for cross-node or
   concurrent multi-node access, but `podMount` mode can also use suitable
   `ReadWriteOnce` storage for sequential checkpoint/restore workflows.
@@ -432,7 +434,7 @@ Failover restore is not yet available. The current Snapshot flow does not suppor
 
 It is possible to checkpoint and restore pods without the Dynamo operator via the lower-level `snapshotctl` utility. However, the snapshot helm chart must be installed, with a running `snapshot-agent` DaemonSet in the namespace with the checkpoint PVC mounted.
 
-`snapshotctl` is intended for lower-level debugging and validation workflows, not as the primary user-facing checkpoint interface. For command details and manifest requirements, see [deploy/snapshot/cmd/snapshotctl/README.md](../../deploy/snapshot/cmd/snapshotctl/README.md).
+`snapshotctl` is intended for lower-level debugging and validation workflows, not as the primary user-facing checkpoint interface. For command details and manifest requirements, see [deploy/snapshot/cmd/snapshotctl/README.md](https://github.com/ai-dynamo/dynamo/blob/main/deploy/snapshot/cmd/snapshotctl/README.md).
 
 ### Checkpoint from a worker pod manifest
 
@@ -632,7 +634,7 @@ If the manifest already carries snapshot target metadata, it must agree with the
 ## Planned Features
 
 - Stable multi-GPU and multinode support
-- TensorRT-LLM support
+- Broader TensorRT-LLM coverage beyond the current single-GPU aggregated text path
 
 ## Related Documentation
 

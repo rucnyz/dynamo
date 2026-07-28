@@ -2,9 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Autoscaling
+subtitle: Scales DGD services with the DynamoGraphDeploymentScalingAdapter using KEDA, Kubernetes HPA, or the Dynamo Planner.
 ---
 
 This guide explains how to configure autoscaling for DynamoGraphDeployment (DGD) services using the `sglang-agg` example from `examples/backends/sglang/deploy/agg.yaml`.
+
+## Scale-to-Zero Limitation
+
+<Warning>
+Scale-to-zero is currently not fully supported for DGD worker components. The
+`DynamoGraphDeploymentScalingAdapter` (DGDSA) and operator accept a replica count of `0`, but when
+every worker for a model scales to zero, the frontend removes the model from `/v1/models` because
+no live `ModelDeploymentCard` remains. Requests for the model return HTTP 404 and do not provide
+a model-specific demand signal that Kubernetes Event-driven Autoscaling (KEDA) or Planner can use
+to scale the workers up again. For request-driven autoscaling, keep at least one replica for each
+required worker component by setting `minReplicas: 1` for the Kubernetes Horizontal Pod
+Autoscaler (HPA) or `minReplicaCount: 1` for KEDA. Scaling back up from zero requires a manual
+action or another external signal that does not depend on frontend model discovery.
+</Warning>
 
 ## Example DGD
 
@@ -220,7 +235,9 @@ spec:
 
 Dynamo exports several metrics useful for autoscaling. These are available at the `/metrics` endpoint on each frontend pod.
 
-> **See also**: For a complete list of all Dynamo metrics, see the [Metrics Reference](../observability/metrics.md). For Prometheus and Grafana setup, see the [Prometheus and Grafana Setup Guide](../observability/prometheus-grafana.md).
+> **See also**: For a complete list of Dynamo metrics, see the
+> [Metrics Catalog](../reference/observability/metrics-catalog.mdx). For Kubernetes dashboards, see
+> [Observability](observability/metrics.mdx).
 
 #### Available Dynamo Metrics
 
@@ -234,7 +251,8 @@ Dynamo exports several metrics useful for autoscaling. These are available at th
 | `dynamo_frontend_inflight_requests` | Gauge | Concurrent requests to engine | ⚠️ **Deprecated** — use `dynamo_frontend_active_requests` |
 | `dynamo_frontend_queued_requests` | Gauge | Requests waiting in HTTP queue | ⚠️ **Deprecated** — use `sum(dynamo_frontend_stage_requests)` across `preprocess` + `route` + `dispatch` |
 
-For the full definition of the `stage` and `phase` labels and derived-signal formulas, see [Stage and phase labels](../observability/metrics.md#stage-and-phase-labels) in the Metrics Reference.
+For the definitions of the `stage` and `phase` labels, see
+[Metric Labels](../reference/observability/metric-labels.mdx#stage-values).
 
 #### Metric Labels
 
@@ -398,13 +416,12 @@ KEDA (Kubernetes Event-driven Autoscaling) extends Kubernetes with event-driven 
 - No Prometheus Adapter configuration needed
 - PromQL queries are defined in the ScaledObject itself (declarative, per-deployment)
 - Easy to update - just `kubectl apply` the ScaledObject
-- Can scale to zero when idle
 - Supports multiple triggers per object
 
 **When to use KEDA:**
 - You want simpler configuration (no Prometheus Adapter to manage)
 - You need event-driven scaling (e.g., queue depth, Kafka, etc.)
-- You want to scale to zero when idle
+- You want event-driven scaling while retaining at least one replica for each required worker component
 
 ### Installing KEDA
 
@@ -677,9 +694,9 @@ spec:
 
 ### 4. Set Sensible Min/Max Replicas
 
-Always configure minimum and maximum replicas in your HPA/KEDA to prevent:
-- Scaling to zero (unless intentional)
-- Unbounded scaling that exhausts cluster resources
+Always configure minimum and maximum replicas in your HPA/KEDA. For request-driven autoscaling, set
+the minimum to `1` or higher for each required worker component because scale-to-zero is not fully
+supported. Set a maximum to prevent unbounded scaling that exhausts cluster resources.
 
 ## Troubleshooting
 
@@ -746,5 +763,5 @@ If you see unstable scaling:
 - [KEDA Documentation](https://keda.sh/)
 - [Prometheus Adapter](https://github.com/kubernetes-sigs/prometheus-adapter)
 - [Planner Documentation](../components/planner/planner-guide.md)
-- [Dynamo Metrics Reference](../observability/metrics.md)
-- [Prometheus and Grafana Setup](../observability/prometheus-grafana.md)
+- [Metrics Catalog](../reference/observability/metrics-catalog.mdx)
+- [Observability](observability/metrics.mdx)

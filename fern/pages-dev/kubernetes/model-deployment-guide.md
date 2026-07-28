@@ -20,7 +20,7 @@ local development or incremental adoption, you can still run the same frontend,
 router, and worker components outside Kubernetes.
 
 You can create a DGD directly from a known-good manifest, or you can use a
-[`DynamoGraphDeploymentRequest`](dgdr.md) (DGDR) to profile your model and
+[`DynamoGraphDeploymentRequest`](dgdr-reference.mdx) (DGDR) to profile your model and
 generate a DGD for you.
 
 Most users only need three ideas before they deploy:
@@ -52,9 +52,9 @@ flowchart LR
 
 | Resource or path | What it is | Use it when | Learn more |
 |---|---|---|---|
-| `DynamoGraphDeployment` (DGD) | The canonical live deployment for a Dynamo inference graph. | You have a known-good configuration or tuned YAML. | [Creating Deployments](deployment/create-deployment.md), [DGD API](api-reference.md#dynamographdeployment) |
+| `DynamoGraphDeployment` (DGD) | The canonical live deployment for a Dynamo inference graph. | You have a known-good configuration or tuned YAML. | [Deploy with DGD](dgd-guide.md), [DGD API](api-reference.md#dynamographdeployment) |
 | `DynamoComponentDeployment` (DCD) | The per-component deployment objects created from a DGD. | Usually not authored directly; inspect them to debug frontend/router/worker rollout. | [DCD API](api-reference.md#dynamocomponentdeployment) |
-| `DynamoGraphDeploymentRequest` (DGDR) | A deploy-by-intent request that profiles your model/hardware and generates a DGD. | You want Dynamo to size the deployment, choose parallelism, configure supported generated-deployment features such as Planner, or produce DGD YAML. | [DGDR Reference](dgdr.md) |
+| `DynamoGraphDeploymentRequest` (DGDR) | A deploy-by-intent request that profiles your model/hardware and generates a DGD. | You want Dynamo to size the deployment, choose parallelism, configure supported generated-deployment features such as Planner, or produce DGD YAML. | [DGDR Reference](dgdr-reference.mdx) |
 | Recipes | Curated `deploy.yaml` manifests that are already DGD specs. | A recipe matches your model, backend, hardware, and serving mode. | [Dynamo recipes](https://github.com/ai-dynamo/dynamo/tree/main/recipes) |
 | `DynamoModel` | Model and adapter lifecycle management layered onto an existing DGD or DCD. | You need declarative model operations such as LoRA adapter loading. | [Managing Models with DynamoModel](deployment/dynamomodel-guide.md) |
 
@@ -67,7 +67,8 @@ are reference material; you can read them as needed instead of going linearly.
 |---|---|---|
 | A recipe matches your model/backend/hardware | Apply the recipe's model cache resources, then apply its `deploy.yaml`. | [Deploy a Tuned DGD from Recipes](#deploy-a-tuned-dgd-from-recipes) |
 | You want Dynamo to generate the deployment | Create a DGDR. Use `autoApply: true` to let the operator create the DGD, or `autoApply: false` to inspect the generated DGD YAML first. | [Use DGDR to Generate a DGD](#use-dgdr-to-generate-a-dgd) |
-| You already know the exact topology | Author or edit a DGD directly, then apply it with `kubectl`. | [Creating Deployments](deployment/create-deployment.md) |
+| You already know the exact topology | Author or edit a DGD directly, then apply it with `kubectl`. | [Deploy with DGD](dgd-guide.md) |
+| You are deploying vLLM on Intel XPU | Use the XPU DRA templates and an XPU runtime image. | [vLLM Deployment Templates](../templates/vllm.mdx) |
 | You are preparing for production | Add model caching, choose backend/search strategy, and validate networking/planner needs. | [Production Details](#production-details) |
 
 ## Deploy a Tuned DGD from Recipes
@@ -135,7 +136,7 @@ details.
 ```
 
 For the DGDR spec reference, field descriptions, and lifecycle phases, see the
-[DGDR Reference](dgdr.md).
+[DGDR Reference](dgdr-reference.mdx).
 
 ## DGDR Detail: Choose a Search Strategy
 
@@ -159,9 +160,10 @@ GPU resources consumed during profiling.
 - Your GPU SKU is in the [AIC support matrix](#aic-support-matrix)
 
 **Limitations:**
-- If AIC does not support your model/hardware/backend combination, the profiler
-  falls back to a naive memory-fit config (basic TP calculation) which may not
-  be optimal.
+- Fallback to a naive memory-fit config only applies after DGDR accepts
+  `hardware.gpuSku`. Fallback sizing depends on AIC system metadata and does
+  not add support for additional GPU SKUs; unsupported model/GPU/backend
+  combinations can fall back but may be suboptimal.
 - Simulated results may differ from real-hardware performance for unusual
   configurations.
 
@@ -177,23 +179,28 @@ benchmarks with AIPerf. Takes 2–4 hours.
 
 **Use thorough when:**
 - Tuning for production and you need the most optimal configuration
-- Your hardware is not supported by AIC (e.g., PCIe GPUs)
 - You want measured rather than simulated performance data
 
 **Constraints:**
 - **Disaggregated mode only** — thorough does not run aggregated configurations.
 - **`backend: auto` is not supported** — you must specify `vllm`, `sglang`, or
   `trtllm`. The DGDR will be rejected if you use `auto` with `thorough`.
+- **Still requires AIC generator support** — thorough measures candidates on
+  real GPUs, but uses AIC to enumerate candidates and generate the final DGD.
 - **Requires GPU resources** — the profiler deploys real inference engines on
   your cluster during profiling.
 
 ## DGDR Detail: AIC Support Matrix
 
-The rapid strategy relies on AIC performance models. AIC currently supports:
+The rapid strategy relies on AIC system metadata and performance models. Check
+the [AIC support matrix](https://ai-dynamo.github.io/aiconfigurator/support-matrix/)
+for the latest support. Measured profiling still needs AIC system and generator
+support to enumerate and render candidates; rapid also needs performance support
+for the exact model/GPU/backend combination.
 
 ### GPU SKUs
 
-| Supported (rapid) | Not Yet Supported (use thorough) |
+| Supported (rapid) | Not supported by rapid |
 |---|---|
 | H100 SXM | V100 (SXM/PCIe) |
 | H100 PCIe | T4 |
@@ -208,13 +215,13 @@ The rapid strategy relies on AIC performance models. AIC currently supports:
 
 <Note>
 Some rapid-mode SKUs use AIC estimate-only data until measured profiles are
-available. Use `searchStrategy: thorough` when you need hardware-measured
-profiling for an estimate-only or unsupported SKU.
+available. Use `searchStrategy: thorough` for measured profiling only when
+DGDR accepts the SKU and AIC has system and generator support for it.
 </Note>
 
 When specifying GPU SKUs manually, use lowercase underscore format (e.g.,
 `h100_sxm`, not `H100-SXM5-80GB`). See the
-[DGDR Reference — SKU Format](dgdr.md#sku-format) for the full list.
+[DGDR Reference — SKU Format](dgdr-reference.mdx#sku-format) for the full list.
 
 ### Backends
 
@@ -285,7 +292,7 @@ the cached weights.
 that `huggingface-cli download` creates when `HF_HOME` is set to the mount
 point. Replace `<org>--<model>` by substituting `/` with `--` in the model ID,
 and replace `<commit-hash>` with the actual snapshot revision. See
-[Model Caching](model-caching.md#find-the-snapshot-path) for how to look up the
+[Model Caching](model-caching.mdx#find-the-snapshot-path) for how to look up the
 hash after downloading.
 
 ### Setup
@@ -296,7 +303,7 @@ hash after downloading.
 2. Run a one-time download Job to populate the PVC.
 3. Reference the PVC in your DGDR's `modelCache` field.
 
-See [Model Caching](model-caching.md) for the full walkthrough with YAML
+See [Model Caching](model-caching.mdx) for the full walkthrough with YAML
 examples.
 
 ### Private and Gated Models
@@ -415,7 +422,7 @@ backend explicitly in these cases:
 | MoE models (DeepSeek-R1, Qwen3-MoE) | `sglang` (full MoE support) |
 | Using `searchStrategy: thorough` | Any except `auto` (required) |
 | TensorRT-LLM compilation caching | `trtllm` (add a compilation cache PVC) |
-| Need load-based planner scaling (FPM) | `vllm` (any config) or `trtllm` (non-attention-DP only). SGLang FPM is wired in Dynamo but the upstream module is not in the 1.2.0 runtime image. |
+| Need load-based planner scaling (FPM) | `vllm` (any config) or `trtllm` (non-attention-DP only). SGLang FPM is wired in Dynamo but the upstream module is not in the 1.2.1 runtime image. |
 
 <Warning>
 TensorRT-LLM does not support Python 3.11. If your environment uses
@@ -426,7 +433,7 @@ Python 3.11, use `vllm` or `sglang` instead.
 
 Each backend handles multinode inference differently:
 
-- **vLLM**: Uses Ray for multi-node TP/PP. Ray head runs on the leader, agents on workers.
+- **vLLM**: Uses PyTorch multiprocessing (mp) backend with distributed initialization flags for multi-node TP/PP. Each node runs its own vLLM process with synchronized training initialization.
 - **SGLang**: Uses `--dist-init-addr`, `--nnodes`, `--node-rank` flags for distributed setup.
 - **TRT-LLM**: MPI-based. The operator auto-generates SSH keypairs; the leader runs `mpirun`.
 
@@ -578,11 +585,11 @@ spec:
 
 ## Further Reading
 
-- [DGDR Reference](dgdr.md) — Spec reference, lifecycle phases, monitoring commands
+- [DGDR Reference](dgdr-reference.mdx) — Spec reference, lifecycle phases, monitoring commands
 - [DGDR Examples](../components/profiler/profiler-examples.md) — Ready-to-use YAML for various scenarios
 - [Profiler Guide](../components/profiler/profiler-guide.md) — Profiling algorithms, picking modes, gate checks
 - [Planner Guide](../components/planner/planner-guide.md) — Scaling modes, PlannerConfig reference
-- [Model Caching](model-caching.md) — PVC setup, ModelExpress, and ModelStreamer
-- [Creating Deployments](deployment/create-deployment.md) — Manual DGD spec for hand-crafted configs
+- [Model Caching](model-caching.mdx) — PVC setup, ModelExpress, and ModelStreamer
+- [Deploy with DGD](dgd-guide.md) — Author and apply a DGD for a custom topology
 - [Multinode Deployments](deployment/multinode-deployment.md) — Grove, LWS, and multinode details
 - [Disaggregated Communication](disagg-communication-guide.md) — NIXL, RDMA, and networking

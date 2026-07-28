@@ -5,10 +5,6 @@ title: Overall Architecture
 subtitle: Architecture and components of the Dynamo inference runtime
 ---
 
-<p align="left">
-  <a href="./architecture.zh-CN.md" hreflang="zh-CN"><img src="../assets/img/readme-zh-cn-link.svg" alt="简体中文" height="28" /></a>
-</p>
-
 Dynamo is a distributed inference runtime for generative AI systems that must operate at high throughput, low latency, and high reliability under changing traffic conditions. It is backend-agnostic (SGLang, TRT-LLM, vLLM, and others) and is built around three cooperating concerns:
 
 - A fast **request path** for token generation
@@ -33,7 +29,7 @@ Modern LLM serving hits recurring bottlenecks:
 
 - **Prefill/decode imbalance** leaves GPUs underutilized when traffic mix shifts ([DistServe](https://arxiv.org/abs/2401.09670)).
 - **KV recomputation** increases TTFT and wastes compute when routing ignores cache overlap ([DeepSeek](https://arxiv.org/abs/2501.12948)).
-- **Memory pressure** from long contexts and concurrency exceeds HBM capacity without multi-tier cache management ([KVBM](https://docs.nvidia.com/dynamo/components/kvbm), [Mooncake](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html), [AIBrix](https://blog.vllm.ai/2025/02/21/aibrix-release.html), [FlexKV](https://github.com/taco-project/FlexKV), [LMCache](https://lmcache.ai/)).
+- **Memory pressure** from long contexts and concurrency exceeds HBM capacity without multi-tier cache management ([KVBM](../components/kvbm/README.md), [Mooncake](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html), [AIBrix](https://blog.vllm.ai/2025/02/21/aibrix-release.html), [FlexKV](https://github.com/taco-project/FlexKV), [LMCache](https://lmcache.ai/)).
 - **Dynamic demand** breaks static provisioning assumptions ([AzureTrace](https://github.com/Azure/AzurePublicDataset)).
 - **Real-world failures** (pod restart, partition, hot-spot overload) require first-class recovery behavior.
 
@@ -132,14 +128,14 @@ In Kubernetes deployments, the same architecture maps to declarative resources:
 
 The diagram labels such as `PodClique A/B`, `ScalingGroup "Prefill"`, `ScalingGroup "Decode"`, and `(replicas, min)` represent this grouped scaling model.
 
-## Deployment Modes
+## Request Routing Topologies
 
 The request plane can be exposed in two ways:
 
-- **Standalone mode** (default) — the Dynamo Frontend is the request entry point and the integrated Dynamo Router selects workers using KV-aware scoring. Used by all local installs and the default Kubernetes deployment.
-- **Gateway mode (GAIE)** — Dynamo runs behind a Kubernetes [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/) gateway. KV-aware routing is performed at the gateway layer by the Dynamo Endpoint Picker Plugin (EPP); the Frontend runs as a sidecar in `--router-mode direct` and respects the EPP's per-request worker selection passed via request headers.
+- **Dynamo-native Frontend routing** -- the Dynamo Frontend is the request entry point and the integrated Dynamo Router selects workers using KV-aware scoring.
+- **Gateway API routing with GAIE** -- a Kubernetes [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) gateway calls the Dynamo Endpoint Picker Plugin (EPP), then forwards to the selected worker's Frontend sidecar in `--router-mode direct`.
 
-Both modes share the same control plane, storage/events plane, and backend integrations — only the request entry point and the location of the routing decision differ. See the [Inference Gateway (GAIE) guide](../kubernetes/inference-gateway.md) for the gateway-mode setup and configuration reference.
+Both topologies share the same control plane, event plane, and backend integrations; only the request entry point and routing boundary differ. See [Gateway API Routing Architecture](gateway-api-routing.md) for the component and request-flow details.
 
 ## Fault Tolerance Architecture
 

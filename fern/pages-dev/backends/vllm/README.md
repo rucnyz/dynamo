@@ -55,14 +55,40 @@ For development, use the [devcontainer](https://github.com/ai-dynamo/dynamo/tree
 | [**KV-Aware Routing**](../../components/router/README.md) | ✅ | |
 | [**SLA-Based Planner**](../../components/planner/planner-guide.md) | ✅ | |
 | [**KVBM**](../../components/kvbm/README.md) | ✅ | |
-| [**LMCache**](../../integrations/lmcache-integration.md) | ✅ | CUDA 12.9 and arm64/aarch64 containers may require building LMCache from source |
-| [**FlexKV**](../../integrations/flexkv-integration.md) | ✅ | |
-| [**Multimodal Support**](vllm-omni.md) | ✅ | Via vLLM-Omni integration |
+| [**LMCache**](../../cli/kv-cache-offloading.mdx) | ✅ | CUDA 12.9 and arm64/aarch64 containers may require building LMCache from source |
+| [**FlexKV**](../../cli/kv-cache-offloading.mdx) | ✅ | Requires a separate FlexKV build |
+| [**Multimodal Support**](../../features/diffusion/README.md) | ✅ | Via vLLM-Omni integration |
 | [**Observability**](vllm-observability.md) | ✅ | Metrics and monitoring |
 | **WideEP** | ✅ | Support for DeepEP |
 | **DP Rank Routing** | ✅ | [Hybrid load balancing](https://docs.vllm.ai/en/stable/serving/data_parallel_deployment/?h=external+dp#hybrid-load-balancing) via external DP rank control |
 | [**LoRA**](https://github.com/ai-dynamo/dynamo/tree/main/examples/backends/vllm/launch/lora/README.md) | ✅ | Dynamic loading/unloading from S3-compatible storage |
 | **GB200 Support** | ✅ | Container functional on main |
+
+## Feature Interactions
+
+vLLM offers the broadest feature coverage in Dynamo, with full support for disaggregated serving, KV-aware routing, KV block management, LoRA adapters, and multimodal inference including video and audio. The matrix below shows which feature pairs are validated to work together.
+
+**Legend:** ✅ Supported &nbsp;|&nbsp; 🚧 Work in Progress / Experimental / Limited
+
+| Feature | Disaggregated Serving | KV-Aware Routing | SLA-Based Planner | KV Block Manager | Multimodal | Request Migration | Request Cancellation | LoRA | Tool Calling | Speculative Decoding |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Disaggregated Serving** | — | | | | | | | | | |
+| **KV-Aware Routing** | ✅ | — | | | | | | | | |
+| **SLA-Based Planner** | ✅ | ✅ | — | | | | | | | |
+| **KV Block Manager** | ✅ | ✅ | ✅ | — | | | | | | |
+| **Multimodal** | ✅ | ✅<sup>1</sup> | — | ✅ | — | | | | | |
+| **Request Migration** | ✅ | ✅ | ✅ | ✅ | ✅ | — | | | | |
+| **Request Cancellation** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | | | |
+| **LoRA** | ✅ | ✅<sup>2</sup> | — | ✅ | — | ✅ | ✅ | — | | |
+| **Tool Calling** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | |
+| **Speculative Decoding** | ✅ | ✅ | — | ✅ | — | ✅ | ✅ | — | ✅ | — |
+
+> **Notes:**
+> 1. **Multimodal + KV-Aware Routing**: Image-aware KV routing is supported in the documented vLLM paths. The default Rust frontend path supports model families handled by `llm-multimodal`; the Python chat-processor path delegates to vLLM's multimodal processor. ([Source](../../features/multimodal/multimodal-kv-routing.md))
+> 2. **KV-Aware LoRA Routing**: vLLM supports routing requests based on LoRA adapter affinity.
+> 3. **Audio Support**: vLLM supports audio models like Qwen2-Audio (experimental). ([Source](../../features/multimodal/multimodal-vllm.md))
+> 4. **Video Support**: vLLM supports video input with frame sampling. ([Source](../../features/multimodal/multimodal-vllm.md))
+> 5. **Speculative Decoding**: Eagle3 support documented. ([Source](../../features/speculative-decoding/speculative-decoding-vllm.md))
 
 ## Quick Start
 
@@ -87,12 +113,50 @@ bash launch/agg.sh
 >
 > Then run the launch script. Without these, workers register but the frontend cannot discover them and requests hang.
 
+### Rust Backend Preview
+
+The Python vLLM backend remains the recommended entry point for production
+deployments and examples. The Rust backend is a development preview for
+validating the Rust `LLMEngine` integration with vLLM's engine-core client.
+Use it when working on the Rust backend contract, cancellation, metrics,
+or P/D wiring; use `python -m dynamo.vllm` or
+`python -m dynamo.vllm.unified_main` for the most complete vLLM feature
+coverage.
+
+<Note>
+The Rust backend depends on vLLM's engine-core crates, which are not yet
+published to crates.io and are pulled as git dependencies. They are gated
+behind the off-by-default `vllm_rs` cargo feature, so the default workspace
+build does not require the git sources and the crate is excluded from the
+published Dynamo crates. You must pass `--features vllm_rs` to build or run it.
+</Note>
+
+To run the Rust backend locally, start the same infrastructure services and
+frontend, then launch the Rust worker in another terminal:
+
+```bash
+docker compose -f dev/docker-compose.yml up -d
+
+python -m dynamo.frontend --http-port 8000
+```
+
+```bash
+DYN_SYSTEM_PORT=8081 cargo run -p dynamo-vllm-rs-backend --features vllm_rs -- Qwen/Qwen3-0.6B -- \
+  --enforce-eager \
+  --max-model-len 4096
+```
+
+The Rust worker starts a managed vLLM engine-core process and registers with
+the Dynamo frontend using the same discovery path as the Python unified
+backend. The Rust backend is expected to become the default only after it
+reaches feature and operational parity with the Python vLLM backend.
+
 ## Next Steps
 
 - **[Reference Guide](vllm-reference-guide.md)**: Configuration, arguments, and operational details
-- **[Examples](vllm-examples.md)**: All deployment patterns with launch scripts
+- **[Examples](vllm-examples.mdx)**: Local deployment launch scripts
 - **[KV Cache Offloading](vllm-kv-offloading.md)**: KVBM, LMCache, and FlexKV integrations
 - **[Observability](vllm-observability.md)**: Metrics and monitoring
-- **[vLLM-Omni](vllm-omni.md)**: Multimodal model serving
+- **[vLLM-Omni](../../features/diffusion/README.md)**: Multimodal model serving
 - **[Kubernetes Deployment](https://github.com/ai-dynamo/dynamo/tree/main/examples/backends/vllm/deploy/README.md)**: Kubernetes deployment guide
 - **[vLLM Documentation](https://docs.vllm.ai/en/stable/)**: Upstream vLLM serve arguments

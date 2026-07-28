@@ -314,7 +314,7 @@ Server-side benchmarking runs directly within the Kubernetes cluster, eliminatin
 
 ## Prerequisites
 
-1. **Kubernetes cluster** with NVIDIA GPUs and Dynamo namespace setup (see [Dynamo Kubernetes Platform docs](../kubernetes/README.md))
+1. **Kubernetes cluster** with NVIDIA GPUs and Dynamo namespace setup (see [Dynamo Kubernetes Platform docs](../kubernetes/quickstart.mdx))
 2. **Storage**: PersistentVolumeClaim configured with appropriate permissions (see [deploy/utils README](https://github.com/ai-dynamo/dynamo/blob/main/deploy/utils/README.md))
 3. **Docker image** containing AIPerf (Dynamo runtime images include it)
 
@@ -427,9 +427,9 @@ For development and testing purposes, Dynamo provides DynoSim and the [mocker ba
 - **CI/CD pipelines** that need to validate infrastructure without model execution
 - **Benchmarking framework validation** to ensure your setup works before using real backends
 
-Mocker is the live simulated engine in DynoSim: it mimics the API and behavior of real backends (SGLang, TensorRT-LLM, vLLM) but generates mock responses instead of running actual inference. Use [DynoSim Runs](../dynosim/runs.md) for one simulated workload/config trial and [DynoSim Sweeps](../dynosim/sweeps.md) when you want to search across many candidate configurations.
+Mocker is the live simulated engine in DynoSim: it mimics the API and behavior of real backends (SGLang, TensorRT-LLM, vLLM) but generates mock responses instead of running actual inference. Use [DynoSim Runs](../dynosim/runs.mdx) for one simulated workload/config trial and [DynoSim Sweeps](../dynosim/sweeps.mdx) when you want to search across many candidate configurations.
 
-See [Live Simulation with Mocker](../dynosim/mocker.md) for usage examples and configuration options.
+See [Live Simulation with Mocker](../dynosim/mocker.mdx) for usage examples and configuration options.
 
 ---
 

@@ -2,67 +2,93 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Request Rejection
+subtitle: Configure independent load thresholds that shed traffic with HTTP 529 before worker latency or memory use becomes unsafe.
 ---
 
-This document describes how Dynamo implements request rejection to prevent system overload and maintain service stability under high load conditions.
+Request rejection (load shedding) rejects new requests when every eligible worker is overloaded,
+rather than accepting work that could exhaust GPU memory or degrade latency for in-flight requests.
+Dynamo returns **HTTP 529** for overload by default so clients can distinguish an available but busy
+service from **HTTP 503**, which indicates that the service is unavailable.
 
-## Overview
+Rejection is **off by default**. Each threshold is independently opt-in: setting one numeric threshold
+enables only that check. You do not need `--admission-control`; that compatibility flag is ignored.
 
-Request rejection (also known as load shedding) is a fault tolerance mechanism that proactively rejects new requests when workers are overloaded. This prevents:
+> **How it works:** The busy-detection formulas, data-parallel rank aggregation, worker-load event
+> processing, and worker-side overflow queue are documented in
+> [Request Rejection Architecture](../design-docs/request-rejection.md).
 
-- Cascading failures from resource exhaustion
-- Degraded latency for all requests
-- Out-of-memory conditions on GPU workers
+<Steps toc={true} tocDepth={2}>
 
-When all workers exceed their configured busy thresholds, new requests receive an HTTP 503 (Service Unavailable) response, signaling clients to retry later.
+<Step title="Choose the load signals">
 
-## Architecture
+Use the signals that match the workers you want to protect:
 
+- Set `--active-decode-blocks-threshold` for decode workers. The value is the fraction of available
+  KV cache blocks in use, from `0.0` through `1.0`.
+- Set `--active-prefill-tokens-threshold` for an absolute prefill-token limit.
+- Set `--active-prefill-tokens-threshold-frac` when the prefill limit should scale with the worker's
+  `max_num_batched_tokens` value.
+
+The checks use OR logic. If you configure more than one threshold, exceeding any configured threshold
+marks that data-parallel rank as busy. A worker is rejected only after all of its ranks are busy, and a
+request is shed only when every eligible worker is busy.
+
+Start conservatively, observe the rejection rate and latency, and then raise the limits. For example,
+a decode-block threshold of `0.75` sheds earlier than `0.90`.
+
+</Step>
+
+<Step title="Enable rejection on the Frontend">
+
+Configure thresholds on the **Frontend** component. Decode-block rejection also requires KV router
+mode because that mode initializes the worker-load metrics path. For long-output workloads, enable
+output-block tracking so generated tokens contribute to the observed KV cache load.
+
+```yaml
+- name: Frontend
+  type: frontend
+  replicas: 1
+  podTemplate:
+    spec:
+      containers:
+        - name: main
+          image: ${RUNTIME_IMAGE}
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - kv
+            - --active-decode-blocks-threshold
+            - "0.85"
+            - --router-track-output-blocks
+            - --active-prefill-tokens-threshold
+            - "10000"
 ```
-                                    ┌─────────────────┐
-                                    │  Worker Monitor │
-                                    │  (Background)   │
-                                    └────────┬────────┘
-                                             │ Updates busy list
-                                             ▼
-┌──────────┐    ┌──────────┐    ┌─────────────────────┐    ┌──────────┐
-│  Client  │───▶│ Frontend │───▶│    Push Router      │───▶│  Worker  │
-└──────────┘    └──────────┘    │ (checks busy list)  │    └──────────┘
-                                └─────────────────────┘
-                                         │
-                                         │ If all workers busy
-                                         ▼
-                                ┌─────────────────────┐
-                                │   HTTP 503 Error    │
-                                │ "All workers busy"  │
-                                └─────────────────────┘
-```
 
-## Configuration
+`--router-track-output-blocks` is especially important for long generations. Without it, a workload
+can fill KV cache with generated tokens without crossing the load value observed by the router.
 
-### Frontend Arguments
+You can configure just one signal. For example, a prefill-only deployment can omit the decode-block
+threshold and KV-specific options. To disable rejection, remove all three threshold settings or set
+their environment-variable values to `None`.
 
-Configure busy thresholds when starting the frontend. `--admission-control token-capacity` is required to activate the thresholds; the default (`none`) leaves them disabled.
+See [Frontend Configuration](../components/frontend/frontend-config-reference.mdx#fault-tolerance)
+for the complete flag, environment-variable, and validation reference.
+
+</Step>
+
+<Step title="Adjust thresholds at runtime">
+
+Optional. Use the Frontend admin API to change thresholds for a discovered model without redeploying.
+The API is available when `DYN_ENABLE_FRONTEND_ADMIN_API=true`, which is the default.
 
 ```bash
-python -m dynamo.frontend \
-    --admission-control token-capacity \
-    --active-decode-blocks-threshold 0.85 \
-    --active-prefill-tokens-threshold 10000
+kubectl port-forward svc/<deployment-name>-frontend 8000:8000 -n ${NAMESPACE}
 ```
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `--active-decode-blocks-threshold` | float (0.0-1.0) | KV cache block utilization threshold |
-| `--active-prefill-tokens-threshold` | int | Prefill token count threshold |
-| `--active-prefill-tokens-threshold-frac` | float | Prefill token threshold as a fraction of `max_num_batched_tokens` |
-| `--admission-control` | `token-capacity` \| `none` | Admission control mode. `token-capacity` applies the busy thresholds above; `none` (the default) clears them while leaving router queueing controlled by `--router-queue-threshold`. To enable busy-worker admission, you must pass `--admission-control token-capacity` |
-
-### Dynamic Configuration via API
-
-Thresholds can be adjusted at runtime via the `/busy_threshold` endpoint:
-
-#### Set Thresholds
+Set one or more thresholds:
 
 ```bash
 curl -X POST http://localhost:8000/busy_threshold \
@@ -74,226 +100,126 @@ curl -X POST http://localhost:8000/busy_threshold \
   }'
 ```
 
-#### Get Current Thresholds
+Read the stored thresholds:
 
 ```bash
 curl http://localhost:8000/busy_threshold
 ```
 
-Response:
-```json
-{
-  "thresholds": [
-    {
-      "model": "Qwen/Qwen3-0.6B",
-      "active_decode_blocks_threshold": 0.85,
-      "active_prefill_tokens_threshold": 10000
-    }
-  ]
-}
+A numeric value enables only its corresponding check. The router applies the new configuration when
+the next worker-load or runtime-configuration update arrives, so the change might not affect a routing
+decision immediately. This endpoint does not enable `--router-mode kv` or
+`--router-track-output-blocks`; set those when the Frontend starts.
+
+</Step>
+
+<Step title="Add a worker-side hard cap">
+
+Optional. A worker can independently cap concurrent engine work and queue only a small burst. Set
+`--engine-request-limit N` (or `DYN_ENGINE_REQUEST_LIMIT`) on the **worker** component:
+
+```yaml
+- name: VllmWorker
+  type: worker
+  podTemplate:
+    spec:
+      containers:
+        - name: main
+          args:
+            - --engine-request-limit
+            - "32"
 ```
 
-## Busy Detection Logic
+When all `N` engine slots and the overflow queue are full, the worker rejects the request and the
+Frontend returns HTTP 529. `DYN_DYNAMO_REQUEST_QUEUE_LIMIT` controls the advanced overflow-queue
+size, defaults to `16`, must be at least `2`, and has an effect only when the engine limit is set. The
+effective cap is `N + Q` in-flight requests per worker.
 
-Workers are marked as "busy" based on a dual-threshold system. A worker is considered busy when **either** threshold is exceeded.
+See [Runtime Configuration](../reference/runtime-config-reference.mdx#operations) for the exact
+fields and [Worker-Side Request Admission](../design-docs/request-rejection.md#worker-side-request-admission)
+for the queue implementation.
 
-### KV Cache Block Threshold
+</Step>
 
-Monitors the percentage of KV cache blocks in use:
+<Step title="Verify rejection">
 
+Inspect the configured thresholds and worker-load metrics:
+
+```bash
+curl -s http://localhost:8000/busy_threshold
+curl -s http://localhost:8000/metrics \
+  | grep -E 'dynamo_frontend_worker_active_(decode_blocks|prefill_tokens)'
 ```
-busy = active_decode_blocks / kv_total_blocks > threshold
-```
 
-Example: With `active_decode_blocks_threshold=0.85`, a worker using 87% of its KV cache blocks is marked busy.
+Generate enough load to exceed the configured threshold, then confirm:
 
-### Prefill Token Threshold
+- The client receives HTTP 529.
+- `dynamo_frontend_model_rejection_total` increases for the affected `model` and `endpoint`.
+- Worker-side hard-cap tests increase `dynamo_rejection_request_total` when both the engine and queue
+  are full.
 
-Monitors the number of tokens currently being prefilled:
+For all metric fields and labels, see
+[Cancellation and Rejection](../reference/observability/metrics-catalog.mdx#cancellation-and-rejection).
 
-```
-busy = active_prefill_tokens > threshold
-```
+</Step>
 
-Example: With `active_prefill_tokens_threshold=10000`, a worker prefilling 12,000 tokens is marked busy.
+</Steps>
 
-### Data-Parallel Rank Aggregation
+## Troubleshoot Decode-Block Rejection
 
-For workers with multiple data-parallel ranks (tensor parallelism), the worker is only marked busy if **ALL** ranks are busy:
+If decode-block load does not produce HTTP 529 responses:
+
+1. Confirm that `GET /busy_threshold` shows a numeric `active_decode_blocks_threshold` for the model.
+2. Confirm that the Frontend started with `--router-mode kv`.
+3. For long-output workloads, confirm that the Frontend started with `--router-track-output-blocks`.
+4. Check that the Frontend receives worker updates:
+
+   ```bash
+   curl -s http://localhost:8000/metrics \
+     | grep dynamo_frontend_worker_active_decode_blocks
+   ```
+
+5. Check Frontend logs for worker-monitor subscription warnings.
+6. Confirm that each worker publishes its total KV block count:
+
+   ```bash
+   curl -s http://<worker-system-port>/metrics \
+     | grep dynamo_component_total_blocks
+   ```
+
+7. Verify the event-plane configuration and connectivity between the Frontend and workers.
+
+`--router-track-active-blocks` is a separate routing option. Busy rejection depends on configured
+thresholds and worker-load events; it does not require that internal router tracking flag.
+
+## Configure Client Retries
+
+Retry HTTP 529 responses with exponential backoff and jitter. Do not retry every HTTP 503 as if it
+were overload; 503 indicates that Dynamo currently has no available service path.
 
 ```python
-def is_busy(worker):
-    return all(rank.is_busy() for rank in worker.dp_ranks)
-```
-
-This prevents false positives when only some ranks are temporarily loaded.
-
-## Worker Load Monitoring
-
-The `KvWorkerMonitor` runs as a background task that:
-
-1. Subscribes to KV cache metrics events from workers
-2. Maintains load state for each worker instance
-3. Recalculates busy instances when metrics change
-4. Updates the router with the current busy list
-
-### Metrics Collected
-
-Workers publish these metrics for monitoring:
-
-| Metric | Description |
-|--------|-------------|
-| `active_decode_blocks` | Number of KV cache blocks currently in use |
-| `kv_total_blocks` | Total KV cache blocks available |
-| `active_prefill_tokens` | Number of tokens currently being prefilled |
-
-## Rejection Behavior
-
-### Request Flow
-
-1. Request arrives at frontend
-2. Push router checks if busy threshold is configured
-3. If configured, router retrieves list of free (non-busy) instances
-4. If no free instances exist (but instances are registered):
-   - Request is rejected with `PipelineError::ServiceOverloaded`
-   - HTTP 503 response is returned to client
-
-### Error Response
-
-When requests are rejected, clients receive:
-
-```http
-HTTP/1.1 503 Service Unavailable
-Content-Type: application/json
-
-{
-  "message": "Service temporarily unavailable: All workers are busy, please retry later",
-  "type": "service_unavailable",
-  "code": 503
-}
-```
-
-### Client Retry Strategy
-
-Clients should implement exponential backoff when receiving 503 responses:
-
-```python
-import time
 import random
+import time
+
 
 def send_with_retry(request, max_retries=5):
     for attempt in range(max_retries):
         response = send_request(request)
-        if response.status_code != 503:
+        if response.status_code != 529:
             return response
-
-        # Exponential backoff with jitter
-        wait_time = min(60, (2 ** attempt) + random.uniform(0, 1))
+        wait_time = min(60, (2**attempt) + random.uniform(0, 1))
         time.sleep(wait_time)
-
-    raise Exception("Max retries exceeded")
+    raise RuntimeError("maximum retries exceeded")
 ```
 
-## Monitoring
-
-### Prometheus Metrics
-
-Track rejection behavior with these metrics:
-
-- `dynamo_frontend_model_rejection_total`: Counter tracking the total number of requests rejected due to resource exhaustion
-  - Labels:
-    - `model`: The model name being served
-    - `endpoint`: The API endpoint that received the request (e.g., `chat_completions`, `completions`, `embeddings`)
-  - This metric is incremented when the router returns a `ResourceExhausted` error because all workers are busy. The rejected request is surfaced to the client as an HTTP 503 response.
-
-**Example metrics output:**
-```text
-dynamo_frontend_model_rejection_total{endpoint="chat_completions",model="Qwen/Qwen3-0.6B"} 32
-dynamo_frontend_model_rejection_total{endpoint="completions",model="Qwen/Qwen3-0.6B"} 5
-```
-
-**Endpoint:** Available on the frontend HTTP service at `/metrics`.
-
-## Tuning Thresholds
-
-### Conservative Settings (Latency-Focused)
-
-For applications prioritizing low latency:
-
-```bash
---active-decode-blocks-threshold 0.70
---active-prefill-tokens-threshold 5000
-```
-
-- Rejects earlier, before workers become fully loaded
-- Maintains lower queue depths
-- Better tail latencies
-
-### Aggressive Settings (Throughput-Focused)
-
-For applications prioritizing throughput:
-
-```bash
---active-decode-blocks-threshold 0.95
---active-prefill-tokens-threshold 20000
-```
-
-- Allows higher worker utilization
-- May increase latency variability
-- Better overall throughput
-
-### Disabled (No Rejection)
-
-To disable request rejection entirely:
-
-```bash
-# Simply don't set the threshold arguments
-python -m dynamo.frontend
-```
-
-Without thresholds configured, all requests are accepted regardless of worker load.
-
-## Best Practices
-
-### 1. Start Conservative, Then Tune
-
-Begin with conservative thresholds and increase based on observed behavior:
-
-```bash
-# Start here
---active-decode-blocks-threshold 0.75
-
-# Increase if rejection rate is too high
---active-decode-blocks-threshold 0.85
-```
-
-### 2. Monitor Before Enabling
-
-Observe worker load patterns before setting thresholds:
-
-```bash
-# Watch KV cache utilization
-watch -n 1 'curl -s localhost:8000/metrics | grep kv_blocks'
-```
-
-### 3. Use Both Thresholds for Disaggregated Serving
-
-In disaggregated deployments:
-- Use `active_prefill_tokens_threshold` for prefill workers
-- Use `active_decode_blocks_threshold` for decode workers
-
-### 4. Coordinate with Autoscaling
-
-If using Kubernetes HPA, ensure rejection thresholds trigger before autoscaling:
-
-```yaml
-# HPA triggers at 70% utilization
-# Rejection at 85% provides buffer
---active-decode-blocks-threshold 0.85
-```
+If an existing client only understands 503 retry semantics, set
+`DYN_HTTP_OVERLOAD_STATUS_CODE=503` on the Frontend. The variable accepts any valid HTTP status code;
+an invalid value falls back to 529.
 
 ## Related Documentation
 
-- [Health Checks](../observability/health-checks.md) - Worker health monitoring
-- [Metrics](../observability/metrics.md) - Available Prometheus metrics
-- [Request Migration](request-migration.md) - Handling failed requests
+- [Request Rejection Architecture](../design-docs/request-rejection.md) - Busy detection, event flow, and admission internals
+- [Frontend Configuration](../components/frontend/frontend-config-reference.mdx#fault-tolerance) - Thresholds, overload status, and admin API
+- [Runtime Configuration](../reference/runtime-config-reference.mdx#operations) - Worker-side engine and queue limits
+- [Metrics Catalog](../reference/observability/metrics-catalog.mdx#cancellation-and-rejection) - Rejection and admission metrics
+- [Request Migration](request-migration.md) - Recovering in-flight requests after worker failure

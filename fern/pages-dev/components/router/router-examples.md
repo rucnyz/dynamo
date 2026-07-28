@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Router Examples
+subtitle: Worked examples for the KvRouter Python API, Kubernetes deployments, and custom routing patterns.
 ---
 
 For quick start instructions, see the [Router README](README.md). This document provides further examples for using the Dynamo Router, including Python API usage, Kubernetes deployments, and custom routing patterns.
@@ -32,7 +33,9 @@ The `KvRouter` provides the following methods:
   - With `request_id`: Updates router lifecycle state to track the request. **Note**: If used with `request_id`, you must call `mark_prefill_complete()` and `free()` at the appropriate lifecycle points to maintain accurate load tracking
   - With `update_indexer=True`: Records the selected worker in the approximate indexer for future overlap predictions. This is only meaningful when `use_kv_events=False`
 
-- **`get_potential_loads(token_ids)`**: Get detailed load information for all workers, including potential prefill tokens and active decode blocks. Returns a list of load dictionaries.
+- **`get_potential_loads(token_ids)`**: Get detailed load information for all workers, including potential prefill tokens, potential decode blocks, and active requests. Returns a list of load dictionaries.
+
+- **`get_overlap_scores(token_ids, ...)`**: Get per-worker KV overlap by storage tier, including shared-cache overlap when configured.
 
 - **`mark_prefill_complete(request_id)`**: Signal that a request has completed its prefill phase. Only used for [manual lifecycle management](#2-manual-state-management-advanced) when using `best_worker()` for manual routing instead of `generate()`.
 
@@ -113,7 +116,7 @@ For basic Kubernetes deployment with the KV Router, see the [Kubernetes Deployme
 - [TRT-LLM aggregated router example](https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/trtllm/deploy/agg_router.yaml)
 - [vLLM aggregated router example](https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/vllm/deploy/agg_router.yaml)
 - [SGLang aggregated router example](https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/sglang/deploy/agg_router.yaml)
-- [Kubernetes deployment guide](../../kubernetes/README.md)
+- [Kubernetes deployment guide](../../kubernetes/quickstart.mdx)
 
 **For A/B Testing and Advanced K8s Setup:**
 See the comprehensive [KV Router A/B Benchmarking Guide](../../benchmarks/kv-router-ab-testing.md) for step-by-step instructions on deploying, configuring, and benchmarking the KV router in Kubernetes.
@@ -143,7 +146,7 @@ spec:
           value: "16"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
 ```
 
 ### Alternative: Using Command Args in K8s
@@ -153,7 +156,7 @@ You can also pass CLI arguments directly in the container command:
 ```yaml
 extraPodSpec:
   mainContainer:
-    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.0
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
     command:
       - /bin/sh
       - -c
@@ -281,6 +284,7 @@ This approach gives you complete control over routing decisions, allowing you to
 - **Minimize TTFT**: Select worker with lowest `potential_prefill_tokens`
 - **Maximize cache reuse**: Use `best_worker()` which considers both prefill and decode loads
 - **Balance load**: Consider both `potential_prefill_tokens` and `potential_decode_blocks` together
+- **Balance active batches**: Include `active_requests` when decode step latency depends materially on request count
 
 See [Router Design](../../design-docs/router-design.md) for architecture details and the cost function algorithm.
 

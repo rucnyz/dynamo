@@ -29,20 +29,20 @@ Dynamo SGLang uses SGLang's native argument parser -- all SGLang engine argument
 
 ### Dynamo-Specific Arguments
 
-These arguments are added by Dynamo on top of SGLang's native arguments.
+These arguments are added by Dynamo on top of SGLang's native arguments. For the complete field-by-field reference of every Dynamo SGLang flag, default, and environment variable, see [SGLang Configuration](sglang-config-reference.mdx).
 
 | Argument | Env Var | Default | Description |
 |----------|---------|---------|-------------|
 | `--endpoint` | `DYN_ENDPOINT` | Auto-generated | Dynamo endpoint in `dyn://namespace.component.endpoint` format |
 | `--use-sglang-tokenizer` | `DYN_SGL_USE_TOKENIZER` | `false` | **[Deprecated]** Use `--dyn-chat-processor sglang` on the frontend instead. See [SGLang Chat Processor](sglang-chat-processor.md). |
-| `--dyn-tool-call-parser` | `DYN_TOOL_CALL_PARSER` | `None` | [Tool call](../../tool-calling/README.md#supported-tool-call-parsers) parser (overrides SGLang's `--tool-call-parser`) |
+| `--dyn-tool-call-parser` | `DYN_TOOL_CALL_PARSER` | `None` | [Tool call](../../tool-calling/README.mdx#supported-tool-call-parsers) parser (overrides SGLang's `--tool-call-parser`) |
 | `--dyn-reasoning-parser` | `DYN_REASONING_PARSER` | `None` | [Reasoning](../../reasoning/README.md#supported-reasoning-parsers) parser for chain-of-thought models |
 | `--custom-jinja-template` | `DYN_CUSTOM_JINJA_TEMPLATE` | `None` | Custom chat template path (incompatible with `--use-sglang-tokenizer`) |
 | `--embedding-worker` | `DYN_SGL_EMBEDDING_WORKER` | `false` | Run as embedding worker (also sets SGLang's `--is-embedding`) |
 | `--multimodal-encode-worker` | `DYN_SGL_MULTIMODAL_ENCODE_WORKER` | `false` | Run as [multimodal](../../features/multimodal/multimodal-sglang.md) encode worker (frontend-facing) |
 | `--multimodal-worker` | `DYN_SGL_MULTIMODAL_WORKER` | `false` | Run as multimodal LLM worker |
-| `--image-diffusion-worker` | `DYN_SGL_IMAGE_DIFFUSION_WORKER` | `false` | Run as [image diffusion](sglang-diffusion.md#image-diffusion) worker |
-| `--video-generation-worker` | `DYN_SGL_VIDEO_GENERATION_WORKER` | `false` | Run as [video generation](sglang-diffusion.md#video-generation) worker |
+| `--image-diffusion-worker` | `DYN_SGL_IMAGE_DIFFUSION_WORKER` | `false` | Run as [image diffusion](../../features/diffusion/text-to-image/README.md#sglang) worker |
+| `--video-generation-worker` | `DYN_SGL_VIDEO_GENERATION_WORKER` | `false` | Run as [video generation](../../features/diffusion/text-to-video/README.md#sglang) worker |
 | `--disagg-config` | `DYN_SGL_DISAGG_CONFIG` | `None` | Path to YAML disaggregation config file |
 | `--disagg-config-key` | `DYN_SGL_DISAGG_CONFIG_KEY` | `None` | Key to select from disaggregation config (e.g., `prefill`, `decode`) |
 
@@ -50,7 +50,7 @@ These arguments are added by Dynamo on top of SGLang's native arguments.
 `--disagg-config` and `--disagg-config-key` must be provided together. The selected section is written to a temp YAML file and passed to SGLang's `--config` flag.
 </Note>
 
-The current supported parser names for both flags are documented in [Tool Call Parsing (Dynamo)](../../tool-calling/README.md#supported-tool-call-parsers) and [Reasoning Parsing (Dynamo)](../../reasoning/README.md#supported-reasoning-parsers).
+The current supported parser names for both flags are documented in [Tool Call Parsing (Dynamo)](../../tool-calling/README.mdx#supported-tool-call-parsers) and [Reasoning Parsing (Dynamo)](../../reasoning/README.md#supported-reasoning-parsers).
 
 ## Tokenizer Behavior
 
@@ -73,7 +73,7 @@ When a client disconnects, Dynamo automatically cancels the in-flight request ac
 
 <Warning>Cancellation during remote prefill in disaggregated mode is not currently supported.</Warning>
 
-For details on the cancellation architecture, see [Request Cancellation](../../fault-tolerance/request-cancellation.md).
+For details on the cancellation architecture, see [Request Cancellation](../../design-docs/request-cancellation.md).
 
 ## Graceful Shutdown
 
@@ -99,7 +99,7 @@ Each worker type has a specialized health check payload that validates the full 
 | Video Generation | Minimal video generation request |
 | Embedding | Standard embedding request |
 
-Health checks are registered with the Dynamo runtime and called by the frontend or Kubernetes liveness probes. See [Health Checks](../../observability/health-checks.md) for the broader health check architecture.
+Health checks are registered with the Dynamo runtime and called by the frontend or Kubernetes liveness probes. See [Observability Architecture](../../design-docs/observability.md#active-worker-health-checks) for the active health-check design.
 
 ## Metrics and KV Events
 
@@ -113,7 +113,8 @@ DYN_SYSTEM_PORT=8081 python -m dynamo.sglang --model-path Qwen/Qwen3-0.6B --enab
 
 Both SGLang engine metrics (`sglang:*` prefix) and Dynamo runtime metrics (`dynamo_*` prefix) are served from the same endpoint.
 
-For metric details, see [SGLang Observability](sglang-observability.md). For visualization setup, see [Prometheus + Grafana](../../observability/prometheus-grafana.md).
+For metric details, see [SGLang Observability](sglang-observability.md). For a visualization
+walkthrough, see [Metrics and Dashboards](../../observability/local-observability.mdx#view-metrics-and-dashboards).
 
 ### KV Events
 
@@ -127,19 +128,19 @@ SGLang workers expose operational endpoints via Dynamo's system server:
 
 | Route | Description |
 |-------|-------------|
-| `/engine/start_profile` | Start PyTorch profiling |
-| `/engine/stop_profile` | Stop profiling and save traces |
-| `/engine/release_memory_occupation` | Release GPU memory for maintenance |
-| `/engine/resume_memory_occupation` | Resume GPU memory after release |
-| `/engine/update_weights_from_disk` | Update model weights from disk |
-| `/engine/update_weights_from_tensor` | Update model weights from tensor payload |
-| `/engine/update_weights_from_distributed` | Update model weights from distributed source |
-| `/engine/update_weights_from_ipc` | Update model weights from IPC payload |
-| `/engine/update_weight_version` | Update weight version metadata |
+| `/engine/control/start_profile` | Start PyTorch profiling |
+| `/engine/control/stop_profile` | Stop profiling and save traces |
+| `/engine/control/release_memory_occupation` | Release GPU memory for maintenance |
+| `/engine/control/resume_memory_occupation` | Resume GPU memory after release |
+| `/engine/control/update_weights_from_disk` | Update model weights from disk |
+| `/engine/control/update_weights_from_tensor` | Update model weights from tensor payload |
+| `/engine/control/update_weights_from_distributed` | Update model weights from distributed source |
+| `/engine/control/update_weights_from_ipc` | Update model weights from IPC payload |
+| `/engine/control/update_weight_version` | Update weight version metadata |
 
 ## See Also
 
-- **[Examples](sglang-examples.md)**: All deployment patterns
+- **[Examples](sglang-examples.mdx)**: Local deployment launch scripts
 - **[Disaggregation](sglang-disaggregation.md)**: P/D architecture and KV transfer
-- **[Diffusion](sglang-diffusion.md)**: LLM, image, and video diffusion models
+- **[Diffusion](../../features/diffusion/README.md)**: LLM, image, and video diffusion models
 - **[Configuration and Tuning](../../components/router/router-configuration.md)**: KV-aware routing configuration
