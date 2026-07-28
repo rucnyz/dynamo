@@ -21,6 +21,7 @@ impl PrefillRouter {
         token_ids: &[u32],
         block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
         lora_name: Option<String>,
+        cache_namespace: Option<String>,
         priority_jump: f64,
         strict_priority: u32,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -46,6 +47,7 @@ impl PrefillRouter {
                         false,
                         false,
                         lora_name,
+                        cache_namespace,
                         priority_jump,
                         strict_priority,
                         None,
@@ -61,15 +63,9 @@ impl PrefillRouter {
                             dp_rank: Some(worker.dp_rank),
                         })
                     }
-                    crate::kv_router::FindBestMatchOutcome::Backpressure {
-                        reason,
-                        queued_isl_tokens,
-                        max_queued_isl_tokens,
-                    } => Ok(PrefillQueryOutcome::Backpressure {
-                        reason,
-                        queued_isl_tokens,
-                        max_queued_isl_tokens,
-                    }),
+                    crate::kv_router::FindBestMatchOutcome::QueueRejected { rejection } => {
+                        Ok(PrefillQueryOutcome::QueueRejected { rejection })
+                    }
                 }
             }
             InnerPrefillRouter::SimpleRouter(router) => {

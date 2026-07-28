@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
+import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, cast
@@ -18,6 +21,8 @@ if TYPE_CHECKING:
 from dynamo._internal.aic import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_MEM_FRACTION_STATIC,
+    AicMemoryEstimatorUnavailableError,
+    _normalize_aic_quant_mode,
     estimate_num_gpu_blocks,
 )
 from dynamo.common.forward_pass_metrics import (
@@ -30,14 +35,37 @@ from dynamo.mocker.utils.kv_cache import compute_kv_bytes_per_token
 from dynamo.replay import run_synthetic_trace_replay, run_trace_replay
 from dynamo.replay.reporting import format_report_table, write_report_json
 
+logger = logging.getLogger(__name__)
+
 
 class PlannerProfileDataResult(Protocol):
     npz_path: Path | None
 
 
 _DEFAULT_AIC_SYSTEM = "h200_sxm"
+_DEFAULT_NUM_GPU_BLOCKS = 16384
 _DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
 _DEFAULT_VLLM_BLOCK_SIZE = 64
+
+
+def _load_router_config(
+    router_config_json: str | None,
+    router_policy_config: str | None,
+):
+    if router_policy_config is None:
+        return (
+            KvRouterConfig.from_json(router_config_json)
+            if router_config_json is not None
+            else None
+        )
+
+    values = json.loads(router_config_json) if router_config_json is not None else {}
+    if not isinstance(values, dict):
+        raise ValueError("--router-config must contain a JSON object")
+    values["router_policy_config"] = router_policy_config
+    return KvRouterConfig.from_json(json.dumps(values))
+
+
 _DEFAULT_SGLANG_BLOCK_SIZE = 1
 _DEFAULT_TRTLLM_BLOCK_SIZE = 32
 
@@ -74,7 +102,31 @@ def _resolve_block_size_for_capacity(raw: dict) -> int:
     return _DEFAULT_VLLM_BLOCK_SIZE
 
 
+def _aic_quant_mode(raw: dict, name: str) -> str | None:
+    # Extract + type-check the raw JSON value here; defer the dtype-vocabulary
+    # normalization (`auto` -> default, `int4` -> `int4_wo`, ...) to the single
+    # source of truth shared with the latency engine and the KV-block estimator.
+    value = raw.get(name)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{name} must be a string when set")
+    return _normalize_aic_quant_mode(value)
+
+
 def _resolve_aic_num_gpu_blocks(raw: dict) -> None:
+    attention_dp = raw.get("aic_attention_dp_size")
+    dp = attention_dp or 1
+    configured_dp = raw.get("dp_size") or 1
+    has_aic_config = raw.get("aic_backend") is not None or attention_dp is not None
+    if has_aic_config and configured_dp > 1 and configured_dp != dp:
+        raise ValueError(
+            "dp_size must match aic_attention_dp_size for AIC-backed replay "
+            f"(got dp_size={configured_dp}, aic_attention_dp_size={dp})"
+        )
+    if attention_dp is not None and dp > 1:
+        # AIC attention-DP describes the silicon scheduler topology, independent
+        # of whether KV capacity is explicit or estimated.
+        raw["dp_size"] = dp
+
     if raw.get("num_gpu_blocks") is not None:
         return
 
@@ -94,37 +146,58 @@ def _resolve_aic_num_gpu_blocks(raw: dict) -> None:
     mem_fraction_static = raw.get("mem_fraction_static")
     free_gpu_memory_fraction = raw.get("free_gpu_memory_fraction")
 
-    raw["num_gpu_blocks"] = estimate_num_gpu_blocks(
-        backend_name=aic_backend,
-        system=raw.get("aic_system") or _DEFAULT_AIC_SYSTEM,
-        model_path=aic_model_path,
-        tp_size=cast(int, tp_size if tp_size is not None else 1),
-        block_size=_resolve_block_size_for_capacity(raw),
-        max_num_batched_tokens=cast(
-            int,
-            max_num_batched_tokens
-            if max_num_batched_tokens is not None
-            else _DEFAULT_MAX_NUM_BATCHED_TOKENS,
-        ),
-        gpu_memory_utilization=cast(
-            float,
-            gpu_memory_utilization
-            if gpu_memory_utilization is not None
-            else DEFAULT_GPU_MEMORY_UTILIZATION,
-        ),
-        mem_fraction_static=cast(
-            float,
-            mem_fraction_static
-            if mem_fraction_static is not None
-            else DEFAULT_MEM_FRACTION_STATIC,
-        ),
-        # None -> aic.py applies the TRT-LLM default (0.9).
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        backend_version=raw.get("aic_backend_version"),
-        moe_tp_size=raw.get("aic_moe_tp_size"),
-        moe_ep_size=raw.get("aic_moe_ep_size"),
-        attention_dp_size=raw.get("aic_attention_dp_size"),
-    )
+    try:
+        per_rank_blocks = estimate_num_gpu_blocks(
+            backend_name=aic_backend,
+            system=raw.get("aic_system") or _DEFAULT_AIC_SYSTEM,
+            model_path=aic_model_path,
+            tp_size=cast(int, tp_size if tp_size is not None else 1),
+            block_size=_resolve_block_size_for_capacity(raw),
+            max_num_batched_tokens=cast(
+                int,
+                max_num_batched_tokens
+                if max_num_batched_tokens is not None
+                else _DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            ),
+            gpu_memory_utilization=cast(
+                float,
+                gpu_memory_utilization
+                if gpu_memory_utilization is not None
+                else DEFAULT_GPU_MEMORY_UTILIZATION,
+            ),
+            mem_fraction_static=cast(
+                float,
+                mem_fraction_static
+                if mem_fraction_static is not None
+                else DEFAULT_MEM_FRACTION_STATIC,
+            ),
+            # None -> aic.py applies the TRT-LLM default (0.9).
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
+            backend_version=raw.get("aic_backend_version"),
+            moe_tp_size=raw.get("aic_moe_tp_size"),
+            moe_ep_size=raw.get("aic_moe_ep_size"),
+            attention_dp_size=raw.get("aic_attention_dp_size"),
+            gemm_dtype=_aic_quant_mode(raw, "aic_gemm_dtype"),
+            moe_dtype=_aic_quant_mode(raw, "aic_moe_dtype"),
+            fmha_dtype=_aic_quant_mode(raw, "aic_fmha_dtype"),
+            kv_cache_dtype=_aic_quant_mode(raw, "aic_kv_cache_dtype"),
+            comm_dtype=_aic_quant_mode(raw, "aic_comm_dtype"),
+        )
+    except AicMemoryEstimatorUnavailableError as exc:
+        logger.warning(
+            "AIC KV-cache capacity estimation is unavailable during replay: %s. "
+            "Falling back to default num_gpu_blocks=%d; upgrade aiconfigurator "
+            "or set num_gpu_blocks explicitly.",
+            exc,
+            _DEFAULT_NUM_GPU_BLOCKS,
+        )
+        raw["num_gpu_blocks"] = _DEFAULT_NUM_GPU_BLOCKS
+        return
+    # AIC returns a per-rank (per-GPU) block count. Under attention-DP the offline runtime
+    # mirrors the live path (lib/llm/src/mocker.rs): each mocker worker owns `dp`
+    # independent per-rank schedulers and KV pools. Keep the per-rank count; engine-wide
+    # capacity stays per_rank * dp, partitioned by rank as on real hardware.
+    raw["num_gpu_blocks"] = per_rank_blocks
 
 
 def _resolve_kv_bytes_per_token(raw: dict) -> None:
@@ -145,7 +218,8 @@ def _resolve_kv_bytes_per_token(raw: dict) -> None:
     if not model_path:
         return
 
-    kv_bytes_per_token = compute_kv_bytes_per_token(model_path, "auto")
+    kv_cache_dtype = _aic_quant_mode(raw, "aic_kv_cache_dtype") or "auto"
+    kv_bytes_per_token = compute_kv_bytes_per_token(model_path, kv_cache_dtype)
     if kv_bytes_per_token is not None:
         raw["kv_bytes_per_token"] = kv_bytes_per_token
 
@@ -197,6 +271,14 @@ def _load_aic_perf_config(args: argparse.Namespace):
         "aic_moe_tp_size": args.aic_moe_tp_size,
         "aic_moe_ep_size": args.aic_moe_ep_size,
         "aic_attention_dp_size": args.aic_attention_dp_size,
+        # Normalize here so `--aic-*-dtype auto` (== model default) doesn't make
+        # the "any AIC value set?" check below think an AIC config was requested
+        # and then demand --aic-backend/--aic-system/--aic-model-path.
+        "aic_gemm_dtype": _normalize_aic_quant_mode(args.aic_gemm_dtype),
+        "aic_moe_dtype": _normalize_aic_quant_mode(args.aic_moe_dtype),
+        "aic_fmha_dtype": _normalize_aic_quant_mode(args.aic_fmha_dtype),
+        "aic_kv_cache_dtype": _normalize_aic_quant_mode(args.aic_kv_cache_dtype),
+        "aic_comm_dtype": _normalize_aic_quant_mode(args.aic_comm_dtype),
         "aic_nextn": args.aic_nextn,
         "aic_nextn_accept_rates": args.aic_nextn_accept_rates,
     }
@@ -221,6 +303,11 @@ def _load_aic_perf_config(args: argparse.Namespace):
         aic_moe_tp_size=values["aic_moe_tp_size"],
         aic_moe_ep_size=values["aic_moe_ep_size"],
         aic_attention_dp_size=values["aic_attention_dp_size"],
+        aic_gemm_dtype=values["aic_gemm_dtype"],
+        aic_moe_dtype=values["aic_moe_dtype"],
+        aic_fmha_dtype=values["aic_fmha_dtype"],
+        aic_kv_cache_dtype=values["aic_kv_cache_dtype"],
+        aic_comm_dtype=values["aic_comm_dtype"],
         aic_nextn=values["aic_nextn"],
         aic_nextn_accept_rates=values["aic_nextn_accept_rates"],
     )
@@ -230,12 +317,13 @@ def _engine_caps(args: MockEngineArgs) -> EngineCapabilities:
     """Derive EngineCapabilities from MockEngineArgs."""
     from dynamo.planner.core.types import EngineCapabilities
 
-    max_kv_tokens = args.num_gpu_blocks * args.block_size
+    dp_size = max(args.dp_size, 1)
+    max_kv_tokens = args.num_gpu_blocks * args.block_size * dp_size
     return EngineCapabilities(
-        num_gpu=1,
+        num_gpu=(args.aic_tp_size or 1) * dp_size,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
-        context_length=max_kv_tokens if max_kv_tokens > 0 else None,
+        context_length=args.max_model_len,
         max_kv_tokens=max_kv_tokens if max_kv_tokens > 0 else None,
         speculative_nextn=args.aic_nextn,
     )
@@ -311,8 +399,27 @@ def _generate_aic_decode_fpms(
     return decode_fpms
 
 
+@dataclass
+class SyntheticWorkload:
+    """A synthetic workload for planner replay: ``request_count`` sessions of fixed
+    ``input_tokens``/``output_tokens``. ``turns_per_session`` > 1 makes each session
+    multi-turn (total requests = ``request_count * turns_per_session``).
+    ``shared_prefix_ratio`` / ``num_prefix_groups`` control prefix-cache sharing."""
+
+    input_tokens: int
+    output_tokens: int
+    request_count: int
+    request_rate: float | None = None
+    arrival_interval_ms: float | None = None
+    arrival_seed: int = 42
+    turns_per_session: int = 1
+    shared_prefix_ratio: float = 0.0
+    num_prefix_groups: int = 0
+    inter_turn_delay_ms: float = 0.0
+
+
 def _run_planner_replay(
-    trace_file: str,
+    trace_file: str | None,
     extra_engine_args: MockEngineArgs | None,
     prefill_engine_args: MockEngineArgs | None,
     decode_engine_args: MockEngineArgs | None,
@@ -324,10 +431,13 @@ def _run_planner_replay(
     arrival_speedup_ratio: float,
     trace_block_size: int,
     planner_config_arg: str,
+    model_name: str | None = None,
     benchmark_granularity: int = 8,
     sla_ttft_ms: float | None = None,
     sla_itl_ms: float | None = None,
     sla_e2e_ms: float | None = None,
+    replay_concurrency: int | None = None,
+    synthetic: SyntheticWorkload | None = None,
 ):
     """Run an offline replay with planner-in-the-loop (agg or disagg).
 
@@ -352,21 +462,54 @@ def _run_planner_replay(
     planner_config = PlannerConfig.from_config_arg(planner_config_arg)
     planner_config.advisory = True
 
+    if (trace_file is None) == (synthetic is None):
+        raise ValueError(
+            "planner replay requires exactly one of trace_file or synthetic"
+        )
+
     if planner_config.mode == "agg":
         if extra_engine_args is None:
             extra_engine_args = MockEngineArgs()
-        bridge = PlannerReplayBridge(
-            trace_file=trace_file,
-            extra_engine_args=extra_engine_args,
-            num_workers=num_workers,
-            router_mode=router_mode,
-            router_config=router_config,
-            arrival_speedup_ratio=arrival_speedup_ratio,
-            trace_block_size=trace_block_size,
-            sla_ttft_ms=sla_ttft_ms,
-            sla_itl_ms=sla_itl_ms,
-            sla_e2e_ms=sla_e2e_ms,
-        )
+        if synthetic is not None:
+            bridge = PlannerReplayBridge.from_synthetic(
+                input_tokens=synthetic.input_tokens,
+                output_tokens=synthetic.output_tokens,
+                request_count=synthetic.request_count,
+                extra_engine_args=extra_engine_args,
+                num_workers=num_workers,
+                router_mode=router_mode,
+                router_config=router_config,
+                model_name=model_name,
+                replay_concurrency=replay_concurrency,
+                arrival_speedup_ratio=arrival_speedup_ratio,
+                request_rate=synthetic.request_rate,
+                arrival_interval_ms=synthetic.arrival_interval_ms,
+                arrival_seed=synthetic.arrival_seed,
+                turns_per_session=synthetic.turns_per_session,
+                shared_prefix_ratio=synthetic.shared_prefix_ratio,
+                num_prefix_groups=synthetic.num_prefix_groups,
+                inter_turn_delay_ms=synthetic.inter_turn_delay_ms,
+                sla_ttft_ms=sla_ttft_ms,
+                sla_itl_ms=sla_itl_ms,
+                sla_e2e_ms=sla_e2e_ms,
+            )
+        else:
+            if trace_file is None:  # guaranteed by the trace/synthetic check above
+                raise ValueError("planner replay needs trace_file in trace mode")
+            bridge = PlannerReplayBridge(
+                trace_file=trace_file,
+                extra_engine_args=extra_engine_args,
+                num_workers=num_workers,
+                router_mode=router_mode,
+                router_config=router_config,
+                model_name=model_name,
+                arrival_speedup_ratio=arrival_speedup_ratio,
+                trace_block_size=trace_block_size,
+                replay_concurrency=replay_concurrency,
+                sla_ttft_ms=sla_ttft_ms,
+                sla_itl_ms=sla_itl_ms,
+                sla_e2e_ms=sla_e2e_ms,
+            )
         capabilities = WorkerCapabilities(decode=_engine_caps(extra_engine_args))
 
     elif planner_config.mode == "disagg":
@@ -374,20 +517,50 @@ def _run_planner_replay(
             raise ValueError(
                 "disagg planner replay requires --prefill-engine-args and --decode-engine-args"
             )
-        bridge = PlannerReplayBridge.create_disagg(
-            trace_file=trace_file,
-            prefill_engine_args=prefill_engine_args,
-            decode_engine_args=decode_engine_args,
-            num_prefill_workers=num_prefill_workers,
-            num_decode_workers=num_decode_workers,
-            router_mode=router_mode,
-            router_config=router_config,
-            arrival_speedup_ratio=arrival_speedup_ratio,
-            trace_block_size=trace_block_size,
-            sla_ttft_ms=sla_ttft_ms,
-            sla_itl_ms=sla_itl_ms,
-            sla_e2e_ms=sla_e2e_ms,
-        )
+        if synthetic is not None:
+            bridge = PlannerReplayBridge.from_synthetic_disagg(
+                input_tokens=synthetic.input_tokens,
+                output_tokens=synthetic.output_tokens,
+                request_count=synthetic.request_count,
+                prefill_engine_args=prefill_engine_args,
+                decode_engine_args=decode_engine_args,
+                num_prefill_workers=num_prefill_workers,
+                num_decode_workers=num_decode_workers,
+                router_mode=router_mode,
+                router_config=router_config,
+                model_name=model_name,
+                replay_concurrency=replay_concurrency,
+                arrival_speedup_ratio=arrival_speedup_ratio,
+                request_rate=synthetic.request_rate,
+                arrival_interval_ms=synthetic.arrival_interval_ms,
+                arrival_seed=synthetic.arrival_seed,
+                turns_per_session=synthetic.turns_per_session,
+                shared_prefix_ratio=synthetic.shared_prefix_ratio,
+                num_prefix_groups=synthetic.num_prefix_groups,
+                inter_turn_delay_ms=synthetic.inter_turn_delay_ms,
+                sla_ttft_ms=sla_ttft_ms,
+                sla_itl_ms=sla_itl_ms,
+                sla_e2e_ms=sla_e2e_ms,
+            )
+        else:
+            if trace_file is None:  # guaranteed by the trace/synthetic check above
+                raise ValueError("planner replay needs trace_file in trace mode")
+            bridge = PlannerReplayBridge.create_disagg(
+                trace_file=trace_file,
+                prefill_engine_args=prefill_engine_args,
+                decode_engine_args=decode_engine_args,
+                num_prefill_workers=num_prefill_workers,
+                num_decode_workers=num_decode_workers,
+                router_mode=router_mode,
+                router_config=router_config,
+                model_name=model_name,
+                arrival_speedup_ratio=arrival_speedup_ratio,
+                trace_block_size=trace_block_size,
+                replay_concurrency=replay_concurrency,
+                sla_ttft_ms=sla_ttft_ms,
+                sla_itl_ms=sla_itl_ms,
+                sla_e2e_ms=sla_e2e_ms,
+            )
         capabilities = WorkerCapabilities(
             prefill=_engine_caps(prefill_engine_args),
             decode=_engine_caps(decode_engine_args),
@@ -448,6 +621,12 @@ def _run_planner_replay(
             try:
                 from dynamo._internal.aic import create_session
 
+                # The bootstrap uses one shared AIC identity (model / backend /
+                # quantization, from ref_args) for both prefill and decode FPM
+                # generation. That matches the planner's current model, where
+                # prefill and decode differ only in parallelism — not in model
+                # or quant — so a single AIC session is sufficient here.
+                # Pre-existing behavior.
                 aic_session = create_session(
                     backend_name=aic_backend,
                     system=ref_args.aic_system,
@@ -457,6 +636,16 @@ def _run_planner_replay(
                     moe_tp_size=ref_args.aic_moe_tp_size,
                     moe_ep_size=ref_args.aic_moe_ep_size,
                     attention_dp_size=ref_args.aic_attention_dp_size,
+                    # Same quant overrides the mocker's latency engine and the
+                    # KV-block estimator use, so the planner's throughput
+                    # regression is bootstrapped at the quantized precision
+                    # instead of the model's default dtype. (AicSession
+                    # normalizes the strings via _resolve_quant_mode.)
+                    gemm_dtype=ref_args.aic_gemm_dtype,
+                    moe_dtype=ref_args.aic_moe_dtype,
+                    fmha_dtype=ref_args.aic_fmha_dtype,
+                    kv_cache_dtype=ref_args.aic_kv_cache_dtype,
+                    comm_dtype=ref_args.aic_comm_dtype,
                     nextn=d_args.aic_nextn,
                     # Model the full verification round; real conditional rates
                     # are consumed only by the mocker's burst sampler.
@@ -525,16 +714,40 @@ def _run_planner_replay(
     # gpu_hours (and prefill/decode_gpus_per_worker) are computed in the mocker
     # from its own worker parallelism (aic_tp x aic_attention_dp) and ride the
     # report dict — no per-engine GPU count from the planner config is needed.
-    return adapter.run()
+    #
+    # Unified drive: the Rust bridge owns the loop and calls back into the adapter
+    # (initial_tick_ms / on_tick) once per PlannerTick; `finalize` wraps the returned
+    # trace_report with the adapter's accumulated scaling events / diagnostics.
+    try:
+        trace_report = bridge.run(adapter)
+    except BaseException:
+        # `finalize` (which closes the engine + replay-scoped event loop) is only
+        # reached on success; ensure cleanup also runs when the Rust loop or a
+        # planner callback raises. `close()` is idempotent.
+        adapter.close()
+        raise
+    return adapter.finalize(trace_report)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m dynamo.replay")
-    parser.add_argument("trace_file", nargs="?")
+    parser.add_argument("trace_files", nargs="*")
     parser.add_argument("--extra-engine-args")
     parser.add_argument("--prefill-engine-args")
     parser.add_argument("--decode-engine-args")
     parser.add_argument("--router-config")
+    parser.add_argument(
+        "--router-policy-config",
+        default=os.environ.get("DYN_ROUTER_POLICY_CONFIG"),
+        help=(
+            "startup-only policy-family and cache-bucket queue YAML path; "
+            "overrides router_policy_config inside --router-config"
+        ),
+    )
+    parser.add_argument(
+        "--model-name",
+        help="model profile to select from --router-policy-config",
+    )
     parser.add_argument("--aic-backend")
     parser.add_argument("--aic-system")
     parser.add_argument("--aic-backend-version")
@@ -543,6 +756,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--aic-moe-tp-size", type=int)
     parser.add_argument("--aic-moe-ep-size", type=int)
     parser.add_argument("--aic-attention-dp-size", type=int)
+    parser.add_argument(
+        "--aic-gemm-dtype",
+        help="dense-GEMM quant mode for the AIC KV-router prefill-load "
+        "estimator, e.g. fp8, fp8_block, int4, nvfp4; 'auto'/omitted = model "
+        "default. Worker-engine quant is set via --extra-engine-args.",
+    )
+    parser.add_argument(
+        "--aic-moe-dtype",
+        help="MoE quant mode for the AIC prefill-load estimator, e.g. fp8, "
+        "nvfp4, w4a16_mxfp4; 'auto'/omitted = model default",
+    )
+    parser.add_argument(
+        "--aic-fmha-dtype",
+        help="attention (FMHA) quant mode for the AIC prefill-load estimator, "
+        "e.g. fp8; 'auto'/omitted = model default",
+    )
+    parser.add_argument(
+        "--aic-kv-cache-dtype",
+        help="KV-cache quant mode for the AIC prefill-load estimator, e.g. fp8, "
+        "int8; 'auto'/omitted = model default",
+    )
+    parser.add_argument(
+        "--aic-comm-dtype",
+        help="communication (collective) quant mode for the AIC prefill-load "
+        "estimator, e.g. fp8, int8; 'auto'/omitted = model default",
+    )
     parser.add_argument("--aic-nextn", type=int)
     parser.add_argument("--aic-nextn-accept-rates")
     parser.add_argument("--input-tokens", type=int)
@@ -552,7 +791,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         help="number of synthetic requests; when --turns-per-session > 1, this is the number of sessions",
     )
-    parser.add_argument("--arrival-interval-ms", type=float, default=1.0)
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        help="Poisson open-loop request rate in requests per second",
+    )
+    parser.add_argument(
+        "--arrival-interval-ms",
+        type=float,
+        help="fixed open-loop interval between synthetic requests in milliseconds",
+    )
+    parser.add_argument(
+        "--arrival-seed",
+        type=int,
+        default=42,
+        help="seed for synthetic open-loop arrival timestamps",
+    )
     parser.add_argument("--turns-per-session", type=int, default=1)
     parser.add_argument("--shared-prefix-ratio", type=float, default=0.0)
     parser.add_argument("--num-prefix-groups", type=int, default=0)
@@ -579,10 +833,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "mooncake-delta",
             "agentic_mooncake",
             "applied_compute_agentic",
+            "dynamo",
         ),
         default="mooncake",
         help=(
-            "format of trace_file when replaying from a file; mooncake-delta "
+            "format of trace files when replaying from files; mooncake-delta "
             "accumulates per-session input deltas into cumulative prompts and "
             "can use substantially more memory than mooncake; agentic_mooncake "
             "replays request-level workflow dependencies"
@@ -591,8 +846,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--trace-block-size",
         type=int,
-        default=512,
-        help="tokens represented by each hash_id in the trace file; only used for file replay",
+        help="tokens represented by each hash_id; defaults to 512 for existing formats and is derived from Dynamo request traces",
     )
     parser.add_argument(
         "--trace-shared-prefix-ratio",
@@ -662,7 +916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
 
-    using_trace_file = args.trace_file is not None
+    using_trace_file = bool(args.trace_files)
     synthetic_args = (args.input_tokens, args.output_tokens, args.request_count)
     using_synthetic = any(value is not None for value in synthetic_args) or any(
         (
@@ -673,6 +927,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
 
+    if args.trace_format == "dynamo" and not using_trace_file:
+        parser.error("--trace-format=dynamo requires at least one trace file")
+    if args.trace_format != "dynamo" and len(args.trace_files) > 1:
+        parser.error(
+            f"--trace-format={args.trace_format} requires exactly one trace file"
+        )
+
     if using_trace_file == using_synthetic:
         parser.error(
             "provide either trace_file or all of --input-tokens/--output-tokens/--request-count"
@@ -680,6 +941,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if using_synthetic and not all(value is not None for value in synthetic_args):
         parser.error(
             "synthetic replay requires --input-tokens, --output-tokens, and --request-count"
+        )
+    if using_synthetic:
+        load_controllers = (
+            args.replay_concurrency,
+            args.request_rate,
+            args.arrival_interval_ms,
+        )
+        if sum(value is not None for value in load_controllers) != 1:
+            parser.error(
+                "synthetic replay requires exactly one of --replay-concurrency, "
+                "--request-rate, or --arrival-interval-ms"
+            )
+    elif args.request_rate is not None or args.arrival_interval_ms is not None:
+        parser.error(
+            "--request-rate and --arrival-interval-ms only apply to synthetic replay"
         )
     if (
         using_trace_file
@@ -717,10 +993,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     extra_engine_args = _load_engine_args(args.extra_engine_args)
     prefill_engine_args = _load_engine_args(args.prefill_engine_args)
     decode_engine_args = _load_engine_args(args.decode_engine_args)
-    router_config = (
-        KvRouterConfig.from_json(args.router_config)
-        if args.router_config is not None
-        else None
+    router_config = _load_router_config(
+        args.router_config,
+        args.router_policy_config,
     )
     try:
         aic_perf_config = _load_aic_perf_config(args)
@@ -731,13 +1006,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.planner_config is not None:
         if args.replay_mode != "offline":
             parser.error("--planner-config only supports --replay-mode=offline")
-        if not using_trace_file:
-            parser.error("--planner-config requires a trace file (not synthetic)")
-        if args.trace_format != "mooncake":
+        if using_trace_file and args.trace_format != "mooncake":
             parser.error("--planner-config only supports --trace-format=mooncake")
 
+        synthetic = None
+        if not using_trace_file:
+            synthetic = SyntheticWorkload(
+                input_tokens=args.input_tokens,
+                output_tokens=args.output_tokens,
+                request_count=args.request_count,
+                request_rate=args.request_rate,
+                arrival_interval_ms=args.arrival_interval_ms,
+                arrival_seed=args.arrival_seed,
+                turns_per_session=args.turns_per_session,
+                shared_prefix_ratio=args.shared_prefix_ratio,
+                num_prefix_groups=args.num_prefix_groups,
+                inter_turn_delay_ms=args.inter_turn_delay_ms,
+            )
+
         planner_report = _run_planner_replay(
-            trace_file=args.trace_file,
+            trace_file=args.trace_files[0] if using_trace_file else None,
             extra_engine_args=extra_engine_args,
             prefill_engine_args=prefill_engine_args,
             decode_engine_args=decode_engine_args,
@@ -747,12 +1035,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_decode_workers=args.num_decode_workers,
             router_mode=args.router_mode,
             arrival_speedup_ratio=args.arrival_speedup_ratio,
-            trace_block_size=args.trace_block_size,
+            trace_block_size=(
+                args.trace_block_size if args.trace_block_size is not None else 512
+            ),
             planner_config_arg=args.planner_config,
+            model_name=args.model_name,
             benchmark_granularity=args.benchmark_granularity,
             sla_ttft_ms=args.sla_ttft_ms,
             sla_itl_ms=args.sla_itl_ms,
             sla_e2e_ms=args.sla_e2e_ms,
+            replay_concurrency=args.replay_concurrency,
+            synthetic=synthetic,
         )
         report = planner_report.trace_report
         if planner_report.scaling_events:
@@ -781,7 +1074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else None
         )
         report = run_trace_replay(
-            args.trace_file,
+            args.trace_files,
             extra_engine_args=extra_engine_args,
             prefill_engine_args=prefill_engine_args,
             decode_engine_args=decode_engine_args,
@@ -800,6 +1093,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trace_num_prefix_groups=args.trace_num_prefix_groups,
             report_jsonl_path=args.report_jsonl,
             max_sim_time_ms=max_sim_time_ms,
+            model_name=args.model_name,
         )
     else:
         report = run_synthetic_trace_replay(
@@ -818,11 +1112,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             replay_mode=args.replay_mode,
             router_mode=args.router_mode,
             arrival_speedup_ratio=args.arrival_speedup_ratio,
+            request_rate=args.request_rate,
             arrival_interval_ms=args.arrival_interval_ms,
+            arrival_seed=args.arrival_seed,
             turns_per_session=args.turns_per_session,
             shared_prefix_ratio=args.shared_prefix_ratio,
             num_prefix_groups=args.num_prefix_groups,
             inter_turn_delay_ms=args.inter_turn_delay_ms,
+            model_name=args.model_name,
         )
 
     report_path = write_report_json(report, args.report_json)

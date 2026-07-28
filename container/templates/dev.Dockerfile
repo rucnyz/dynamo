@@ -134,6 +134,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Add external repos (NVIDIA devtools, GitHub CLI) and install in one pass.
 # Cache apt downloads; sharing=locked avoids apt/dpkg races with concurrent builds.
+#
+# ==================== TEMPORARY WORKAROUND ====================
+# The devtools repo index lists "Filename: ./nsight-systems-...deb", so apt
+# requests the "/./" literally and that bucket 404s on it (the CUDA repo
+# normalizes fine). Fetch the normalized URL directly instead of by name.
+# Revert to a plain apt-get install once NVIDIA fixes the bucket.
+# ==============================================================
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     wget -qO - "https://developer.download.nvidia.com/devtools/repos/ubuntu2404/${TARGETARCH}/nvidia.pub" \
         | gpg --dearmor -o /etc/apt/keyrings/nvidia-devtools.gpg && \
@@ -144,7 +151,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     echo "deb [arch=${TARGETARCH} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
     apt-get update && \
-    apt-get install -y --no-install-recommends nsight-systems-2025.5.1 gh && \
+    curl --retry 3 --retry-delay 5 -fsSL -o /tmp/nsys.deb \
+        "https://developer.download.nvidia.com/devtools/repos/ubuntu2404/${TARGETARCH}/nsight-systems-2025.5.1_2025.5.1.121-1_${TARGETARCH}.deb" && \
+    apt-get install -y --no-install-recommends /tmp/nsys.deb gh && \
+    rm -f /tmp/nsys.deb && \
     rm -rf /var/lib/apt/lists/*
 
 # ======================================================================
@@ -290,18 +300,16 @@ SHELL ["/bin/bash", "-l", "-o", "pipefail", "-c"]
 # We stash the pre-tools python3 (which may be a real binary or a symlink we created earlier for vLLM/TRTLLM)
 # and restore it after copying toolchains from dynamo_tools.
 RUN if [ -e /usr/bin/python3 ]; then cp -a /usr/bin/python3 /tmp/python3.pretools; fi
-COPY --from=dynamo_tools /usr/bin/ /usr/bin/
-COPY --from=dynamo_tools /usr/sbin/ /usr/sbin/
-COPY --from=dynamo_tools /usr/lib/ /usr/lib/
-COPY --from=dynamo_tools /usr/libexec/ /usr/libexec/
-COPY --from=dynamo_tools /usr/include/ /usr/include/
-COPY --from=dynamo_tools /lib/ /lib/
-COPY --from=dynamo_tools /usr/share/ /usr/share/
+# Pull the developer toolchain from dynamo_tools in as few COPY layers as
+# possible (overlay2 caps a downstream image at ~128 layers). The six /usr/*
+# subtrees collapse into one COPY; --exclude=local skips the multi-GB /usr/local
+# (CUDA, etc.) the dev image already inherits from its own base.
+COPY --from=dynamo_tools --exclude=local /usr/ /usr/
+COPY --from=dynamo_tools /opt/nvidia/ /opt/nvidia/
 COPY --from=dynamo_tools /etc/alternatives/ /etc/alternatives/
 COPY --from=dynamo_tools /etc/bash_completion.d/ /etc/bash_completion.d/
 COPY --from=dynamo_tools /etc/sudoers /etc/sudoers
 COPY --from=dynamo_tools /etc/sudoers.d/ /etc/sudoers.d/
-COPY --from=dynamo_tools /opt/nvidia/ /opt/nvidia/
 
 # Restore the pre-tools python3 (keeps SGLang system python intact and avoids venv symlink loops).
 RUN if [ -e /tmp/python3.pretools ]; then cp -af /tmp/python3.pretools /usr/bin/python3; fi
@@ -398,9 +406,6 @@ RUN if [ ! -d /opt/dynamo/venv ]; then \
     fi
 {% endif %}
 
-# Initialize Git LFS for the dynamo user (required for requirements with lfs=true)
-RUN git lfs install
-
 # Install only the ADDITIONAL dev/test dependencies.
 # Runtime deps (common, framework, planner, benchmark) are already installed
 # in the parent runtime image — re-resolving them here would risk version drift.
@@ -411,6 +416,8 @@ RUN --mount=type=bind,source=./container/deps/requirements.dev.txt,target=/tmp/r
     # Cache uv downloads; uv handles its own locking for this cache.
     --mount=type=cache,target=/root/.cache/uv \
     export UV_CACHE_DIR=/root/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    # Git LFS init (needed for requirements with lfs=true); folded in to save a layer.
+    git lfs install && \
 {% if device == "xpu" and framework == "sglang" %}
     uv pip install \
         --python ${VIRTUAL_ENV}/bin/python \
@@ -471,10 +478,8 @@ ENV DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA
 RUN --mount=type=bind,source=./container/launch_message/dev.txt,target=/opt/dynamo/launch_message.txt \
     sed '/^#\s/d' /opt/dynamo/launch_message.txt > /opt/dynamo/.launch_screen && \
     chmod 755 /opt/dynamo/.launch_screen && \
-    (grep -q 'launch_screen' /etc/bash.bashrc || echo 'cat /opt/dynamo/.launch_screen' >> /etc/bash.bashrc)
-
-# Warn on interactive entry if /workspace is not bind-mounted from the host
-RUN printf '%s\n' \
+    (grep -q 'launch_screen' /etc/bash.bashrc || echo 'cat /opt/dynamo/.launch_screen' >> /etc/bash.bashrc) && \
+    printf '%s\n' \
     'if [ ! -f /workspace/Cargo.toml ]; then' \
     '    echo ""' \
     '    echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"' \

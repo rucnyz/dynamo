@@ -23,9 +23,9 @@ pub(crate) use collector::TraceCollector;
 #[cfg(test)]
 pub(crate) use collector::TraceRequestStatsSnapshot;
 pub use collector::{
-    PerRequestRecord, SlaThresholds, TraceDistributionStats, TraceGoodputStats,
-    TraceInterTokenLatencyStats, TraceLatencyStats, TraceRequestCounts, TraceSimulationReport,
-    TraceThroughputStats,
+    PerRequestRecord, ReplayTerminalStatus, SlaThresholds, TraceDistributionStats,
+    TraceGoodputStats, TraceInterTokenLatencyStats, TraceLatencyStats, TraceRequestCounts,
+    TraceSimulationReport, TraceThroughputStats,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayRouterMode {
@@ -62,7 +62,8 @@ impl OfflineDisaggReplayConfig {
 
 pub use entrypoints::{
     ReplayKvEventVisibility, generate_trace_worker_artifacts_offline,
-    generate_trace_worker_artifacts_offline_with_kv_event_visibility, simulate_concurrency_file,
+    generate_trace_worker_artifacts_offline_with_kv_event_visibility,
+    simulate_agentic_trace_workload_with_router_mode, simulate_concurrency_file,
     simulate_concurrency_file_disagg_with_router_mode,
     simulate_concurrency_file_disagg_with_router_mode_and_format,
     simulate_concurrency_file_with_router_mode,
@@ -74,7 +75,12 @@ pub use entrypoints::{
     simulate_concurrency_requests_disagg_with_router_mode,
     simulate_concurrency_requests_with_router_mode, simulate_concurrency_workload,
     simulate_concurrency_workload_disagg_with_router_mode,
-    simulate_concurrency_workload_with_router_mode, simulate_trace_file,
+    simulate_concurrency_workload_disagg_with_router_mode_and_options,
+    simulate_concurrency_workload_with_router_mode,
+    simulate_concurrency_workload_with_router_mode_and_options,
+    simulate_loaded_trace_disagg_with_router_mode_and_options,
+    simulate_loaded_trace_live_with_router_mode,
+    simulate_loaded_trace_with_router_mode_and_options, simulate_trace_file,
     simulate_trace_file_disagg_with_router_mode,
     simulate_trace_file_disagg_with_router_mode_and_format, simulate_trace_file_with_router_mode,
     simulate_trace_file_with_router_mode_and_format, simulate_trace_live_file,
@@ -86,7 +92,13 @@ pub use entrypoints::{
     simulate_trace_workload, simulate_trace_workload_disagg_with_router_mode,
     simulate_trace_workload_with_router_mode,
 };
-pub use planner_handle::{PlannerReplayHandle, PlannerTickData};
+pub use offline::components::TrafficStats;
+pub use offline::planner_hook::{
+    NoopPlannerHook, PlannerHook, PlannerTickDecision, PlannerTickMetrics,
+};
+#[doc(hidden)]
+pub use offline::run_offline_handoff_conformance;
+pub use planner_handle::PlannerReplayHandle;
 pub use validate::validate_replay_args_mode;
 
 pub(crate) fn normalize_trace_requests(
@@ -137,6 +149,10 @@ mod tests {
 
     #[test]
     fn test_replay_itl_uses_per_token_gaps() {
+        fn assert_ddsketch_relative_error(actual: f64, expected: f64) {
+            assert!((actual - expected).abs() <= expected.abs() * 0.001 + f64::EPSILON);
+        }
+
         let mut collector = TraceCollector::default();
         let uuid = Uuid::from_u128(11);
 
@@ -146,15 +162,16 @@ mod tests {
         collector.on_token(uuid, 11.0);
         collector.on_token(uuid, 12.0);
         collector.on_token(uuid, 110.0);
+        collector.on_terminal(uuid, 110.0, ReplayTerminalStatus::Completed);
 
         let report = collector.finish();
 
         assert!((report.latency.tpot.mean_ms - (100.0 / 3.0)).abs() < 1e-9);
         assert!((report.latency.itl.distribution.mean_ms - (100.0 / 3.0)).abs() < 1e-9);
-        assert_eq!(report.latency.itl.distribution.median_ms, 1.0);
-        assert_eq!(report.latency.itl.distribution.p75_ms, 98.0);
-        assert_eq!(report.latency.itl.distribution.p90_ms, 98.0);
-        assert_eq!(report.latency.itl.distribution.p95_ms, 98.0);
+        assert_ddsketch_relative_error(report.latency.itl.distribution.median_ms, 1.0);
+        assert_ddsketch_relative_error(report.latency.itl.distribution.p75_ms, 98.0);
+        assert_ddsketch_relative_error(report.latency.itl.distribution.p90_ms, 98.0);
+        assert_ddsketch_relative_error(report.latency.itl.distribution.p95_ms, 98.0);
         assert_eq!(report.latency.itl.max_ms, 98.0);
         assert_eq!(report.latency.ttst.min_ms, 1.0);
         assert_eq!(report.latency.ttst.max_ms, 1.0);
@@ -174,6 +191,7 @@ mod tests {
             DirectRequest {
                 tokens: vec![1; 4],
                 max_output_tokens: 1,
+                output_token_ids: None,
                 uuid: Some(Uuid::from_u128(1)),
                 dp_rank: 0,
                 arrival_timestamp_ms: Some(100.0),
@@ -182,6 +200,7 @@ mod tests {
             DirectRequest {
                 tokens: vec![2; 4],
                 max_output_tokens: 1,
+                output_token_ids: None,
                 uuid: Some(Uuid::from_u128(2)),
                 dp_rank: 0,
                 arrival_timestamp_ms: Some(200.0),

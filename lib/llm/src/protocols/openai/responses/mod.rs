@@ -17,7 +17,7 @@ use dynamo_protocols::types::responses::{
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImageArgs,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
@@ -34,13 +34,13 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionResponse};
-use super::nvext::{NvExt, NvExtProvider};
 use super::{OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider};
+use crate::protocols::common::extensions::{NvExt, NvExtProvider};
 
 /// Request body for `POST /v1/responses`. Uses a plain
 /// `#[derive(Deserialize)]` — the relaxed input shapes are handled by
-/// Dynamo-owning the input chain in `dynamo_protocols::types::responses`
-/// (see that crate's `CLAUDE.md`), not by a custom pre-parse JSON patcher.
+/// Dynamo-owning the input chain in `dynamo_protocols::types::responses`,
+/// not by a custom pre-parse JSON patcher.
 /// An earlier iteration of this type carried a hand-written `impl Deserialize`
 /// that walked `serde_json::Value` to inject synthetic defaults for missing
 /// `id` / `status` / `annotations`; that was replaced by typed ownership for
@@ -61,6 +61,7 @@ pub struct NvCreateResponse {
     pub inner: dynamo_protocols::types::responses::CreateResponse,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
     pub nvext: Option<NvExt>,
 }
 
@@ -101,8 +102,8 @@ pub struct NvResponse {
 ///     `store`) that are absent from upstream `Response` entirely.
 ///
 /// Rather than fork the upstream output chain (which would cascade into
-/// `OutputItem`, streaming events, and a long tail of sub-types, per
-/// `lib/protocols/CLAUDE.md`), we patch the serialized JSON. Adds a
+/// `OutputItem`, streaming events, and a long tail of sub-types), we patch
+/// the serialized JSON. Adds a
 /// single `serde_json::to_value` round-trip per response, which is
 /// negligible next to tokenization/inference cost.
 pub(crate) fn patch_response_for_spec(
@@ -286,15 +287,12 @@ fn convert_input_content_to_user_content(
                     .ok_or_else(|| anyhow::anyhow!("input_image requires image_url"))?;
                 let url = url::Url::parse(url_str)
                     .map_err(|e| anyhow::anyhow!("Invalid image URL '{}': {}", url_str, e))?;
-                chat_parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
-                    ChatCompletionRequestMessageContentPartImage {
-                        image_url: ImageUrl {
-                            url,
-                            detail: Some(convert_image_detail_str(&img.detail)),
-                            uuid: None,
-                        },
-                    },
-                ));
+                let mut image_url = ImageUrl::from(url.to_string());
+                image_url.detail = Some(convert_image_detail_str(&img.detail));
+                let image_part = ChatCompletionRequestMessageContentPartImageArgs::default()
+                    .image_url(image_url)
+                    .build()?;
+                chat_parts.push(image_part.into());
             }
             // TODO: handle InputVideo / InputAudio when upstream adds them
             InputContent::InputFile(_) => {
@@ -1011,7 +1009,7 @@ pub fn chat_completion_to_response(
             && !reasoning_text.is_empty()
         {
             output.push(OutputItem::Reasoning(ReasoningItem {
-                id: format!("rs_{}", Uuid::new_v4().simple()),
+                id: Some(format!("rs_{}", Uuid::new_v4().simple())),
                 summary: vec![SummaryPart::SummaryText(SummaryTextContent {
                     text: reasoning_text,
                 })],
@@ -1959,7 +1957,9 @@ mod tests {
         // Regression: Codex / Agents SDK round-trip Item::Reasoning mid-turn.
         // The converter must route the reasoning summary into the coalesced
         // assistant message's `reasoning_content`, not silently drop it.
-        use dynamo_protocols::types::responses::{ReasoningItem, SummaryPart, SummaryTextContent};
+        use dynamo_protocols::types::responses::{
+            InputReasoningItem, SummaryPart, SummaryTextContent,
+        };
 
         let req = NvCreateResponse {
             inner: CreateResponse {
@@ -1971,8 +1971,8 @@ mod tests {
                         role: InputRole::User,
                         status: None,
                     }))),
-                    InputItem::Item(Item::Reasoning(ReasoningItem {
-                        id: "rs_1".into(),
+                    InputItem::Item(Item::Reasoning(InputReasoningItem {
+                        id: Some("rs_1".into()),
                         summary: vec![SummaryPart::SummaryText(SummaryTextContent {
                             text: "thinking step 1".into(),
                         })],
@@ -2609,7 +2609,7 @@ thinking
         let schema = ResponseFormatJsonSchema {
             name: "city".into(),
             description: None,
-            schema: Some(serde_json::json!({"type": "object"})),
+            schema: serde_json::json!({"type": "object"}),
             strict: Some(true),
         };
         let mut req = make_response_with_input("structured");

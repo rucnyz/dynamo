@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
+use crate::protocols::common::extensions::AgentContext;
 use crate::protocols::common::timing::RequestTracker;
-use crate::protocols::openai::nvext::AgentContext;
-use crate::request_trace::{RequestReplayMetrics, RequestTraceEventSource};
+use crate::request_trace::RequestReplayMetrics;
+use crate::request_trace::RequestTraceEventSource;
+use crate::request_trace::RequestTracePayload;
 
-use super::{
-    RequestTraceEventType, RequestTraceMetrics, RequestTraceRecord, RequestTraceSchema, publish,
-};
+use super::RequestTraceEventType;
+use super::RequestTraceMetrics;
+use super::RequestTraceRecord;
+use super::RequestTraceSchema;
+use super::publish;
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -85,6 +90,7 @@ pub(crate) fn emit_request_end(
         agent_context: None,
         request: Some(request),
         tool: None,
+        payload: None,
     });
 }
 
@@ -101,10 +107,28 @@ pub(crate) fn emit_agent_request_end(
         agent_context: Some(agent_context),
         request: Some(request),
         tool: None,
+        payload: None,
+    });
+}
+
+pub(crate) fn emit_request_payload(payload: RequestTracePayload, event_time_unix_ms: u64) {
+    publish(RequestTraceRecord {
+        schema: RequestTraceSchema::V1,
+        event_type: RequestTraceEventType::RequestPayload,
+        event_time_unix_ms,
+        event_source: Some(RequestTraceEventSource::Dynamo),
+        agent_context: None,
+        request: None,
+        tool: None,
+        payload: Some(payload),
     });
 }
 
 pub(crate) fn publish_tool_record(record: RequestTraceRecord) {
+    if !super::config::capture_enabled() || !super::config::policy().emit_tool_records() {
+        return;
+    }
+
     if let Err(error) = validate_tool_record(&record) {
         tracing::warn!(
             %error,
@@ -142,13 +166,17 @@ pub(crate) fn validate_tool_record(record: &RequestTraceRecord) -> anyhow::Resul
     if record.request.is_some() {
         anyhow::bail!("tool event must not include request metrics");
     }
+    if record.payload.is_some() {
+        anyhow::bail!("tool event must not include request payload");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request_trace::{BUS, RequestTraceToolEvent};
+    use crate::request_trace::BUS;
+    use crate::request_trace::RequestTraceToolEvent;
 
     #[tokio::test]
     async fn emits_tracker_timing_lengths_and_hashes() {
@@ -209,11 +237,10 @@ mod tests {
             event_time_unix_ms: 2_000,
             event_source: Some(RequestTraceEventSource::Harness),
             agent_context: Some(AgentContext {
-                session_type_id: "agent_harness".to_string(),
-                session_id: "run-1".to_string(),
-                trajectory_id: "root".to_string(),
-                parent_trajectory_id: None,
-                trajectory_final: None,
+                session_id: "root".to_string(),
+                parent_session_id: None,
+                session_final: None,
+                kv_hints: None,
             }),
             request: None,
             tool: Some(RequestTraceToolEvent {
@@ -228,6 +255,7 @@ mod tests {
                 tool_name_hash: None,
                 error_type: None,
             }),
+            payload: None,
         };
 
         let err = validate_tool_record(&record).expect_err("NaN duration should fail validation");
