@@ -158,6 +158,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         results = await self.engine.async_generate(
             **input_param,
             **mm_kwargs,
+            **self._program_id_kwargs(inner_request),
             sampling_params=sampling_params,
             stream=True,
             **require_reasoning_kwargs(self.engine, inner_request),

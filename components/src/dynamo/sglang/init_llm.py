@@ -60,6 +60,9 @@ async def init_decode(
     clear_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.clear_kv_blocks"
     )
+    end_program_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.end_program"
+    )
 
     # Use pre-created engine if provided (snapshot mode)
     if snapshot_engine is not None:
@@ -91,7 +94,7 @@ async def init_decode(
         f"{dynamo_args.namespace}.{dynamo_args.component}.list_loras"
     )
 
-    shutdown_endpoints[:] = [generate_endpoint]
+    shutdown_endpoints[:] = [generate_endpoint, end_program_endpoint]
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -167,6 +170,10 @@ async def init_decode(
                 handler.clear_kv_blocks,
                 metrics_labels=metrics_labels,
             ),
+            end_program_endpoint.serve_endpoint(
+                handler.end_program,
+                metrics_labels=metrics_labels,
+            ),
             register_model_with_readiness_gate(
                 engine,
                 generate_endpoint,
@@ -216,6 +223,9 @@ async def init_prefill(
     clear_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.clear_kv_blocks"
     )
+    end_program_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.end_program"
+    )
 
     # Use pre-created engine if provided (snapshot mode)
     if snapshot_engine is not None:
@@ -247,7 +257,7 @@ async def init_prefill(
         f"{dynamo_args.namespace}.{dynamo_args.component}.list_loras"
     )
 
-    shutdown_endpoints[:] = [generate_endpoint]
+    shutdown_endpoints[:] = [generate_endpoint, end_program_endpoint]
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -304,6 +314,10 @@ async def init_prefill(
             ),
             clear_endpoint.serve_endpoint(
                 handler.clear_kv_blocks,
+                metrics_labels=metrics_labels,
+            ),
+            end_program_endpoint.serve_endpoint(
+                handler.end_program,
                 metrics_labels=metrics_labels,
             ),
             register_model_with_readiness_gate(

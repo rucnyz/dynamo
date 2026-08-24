@@ -397,6 +397,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             decode = await self.engine.async_generate(
                 **input_param,
                 **decode_mm_kwargs,
+                **self._program_id_kwargs(request),
                 sampling_params=sampling_params,
                 stream=True,
                 **require_reasoning_kwargs(self.engine, request),
@@ -466,6 +467,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
             agg = await self.engine.async_generate(
                 **input_param,
+                **self._program_id_kwargs(request),
                 image_data=image_data,
                 audio_data=audio_data,
                 video_data=video_data,

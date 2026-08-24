@@ -26,6 +26,7 @@ import sglang as sgl
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 from dynamo._core import Context
+from dynamo.common.agent_lifecycle import extract_program_id
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.lora.manager import get_lora_manager
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
@@ -43,7 +44,10 @@ from dynamo.llm import (
 )
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.runtime import DistributedRuntime
-from dynamo.sglang._compat import start_profile_compat
+from dynamo.sglang._compat import (
+    filter_supported_async_generate_kwargs,
+    start_profile_compat,
+)
 from dynamo.sglang.args import Config
 from dynamo.sglang.pause import SGLangEnginePauseController
 from dynamo.sglang.publisher import DynamoSglangPublisher
@@ -702,6 +706,110 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
                 normalized = -normalized
             return {"priority": normalized}
         return {}
+
+    def _program_id_kwargs(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the required SGLang aginfer identity argument.
+
+        Requests without agent lifecycle metadata remain fully compatible with
+        stock SGLang.  Once a program id is supplied, silently dropping it
+        would leak Dead KV, so fail clearly when the selected SGLang build does
+        not expose ``Engine.async_generate(program_id=...)``.
+        """
+
+        program_id = extract_program_id(request)
+        if program_id is None:
+            return {}
+        kwargs = filter_supported_async_generate_kwargs(
+            self.engine, {"program_id": program_id}
+        )
+        if "program_id" not in kwargs:
+            raise RuntimeError(
+                "agent lifecycle metadata requires an aginfer-enabled SGLang "
+                "Engine.async_generate(program_id=...)"
+            )
+        return kwargs
+
+    @staticmethod
+    def _end_program_ack_complete(result: Any) -> bool:
+        """Validate that every engine rank finished, rather than queued, cleanup."""
+
+        if not isinstance(result, list) or not result:
+            return False
+        for item in result:
+            if dataclasses.is_dataclass(item) and not isinstance(item, type):
+                item = dataclasses.asdict(item)
+            if not isinstance(item, dict):
+                return False
+            if not item.get("ok") or item.get("deferred"):
+                return False
+        return True
+
+    async def end_program(
+        self, body: Optional[Dict[str, Any]] = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """End one program on this worker and wait for engine acknowledgement.
+
+        The preferred aginfer SGLang contract is
+        ``await Engine.async_end_program(program_id)``.  A synchronous
+        ``Engine.end_program(program_id)`` fallback is run in a worker thread
+        because SGLang's sync Engine methods commonly drive their own event
+        loop.  Both forms must be idempotent because a router retries all
+        target workers after a partial control-plane failure.
+        """
+
+        body = body or {}
+        program_id = body.get("program_id")
+        if not isinstance(program_id, str) or not program_id.strip():
+            yield {"status": "error", "message": "program_id is required"}
+            return
+        program_id = program_id.strip()
+
+        async_end_program = getattr(self.engine, "async_end_program", None)
+        sync_end_program = getattr(self.engine, "end_program", None)
+        if not callable(async_end_program) and not callable(sync_end_program):
+            yield {
+                "status": "error",
+                "program_id": program_id,
+                "message": (
+                    "SGLang engine does not support async_end_program(program_id) "
+                    "or end_program(program_id); "
+                    "install the aginfer-enabled SGLang build"
+                ),
+            }
+            return
+
+        try:
+            if callable(async_end_program):
+                result = async_end_program(program_id, session_id=program_id)
+            else:
+                # A sync SGLang Engine method may call its own
+                # loop.run_until_complete(). Never invoke it on this worker's
+                # active asyncio loop.
+                result = await asyncio.to_thread(
+                    sync_end_program, program_id, session_id=program_id
+                )
+            if inspect.isawaitable(result):
+                result = await result
+            if not self._end_program_ack_complete(result):
+                yield {
+                    "status": "error",
+                    "program_id": program_id,
+                    "message": "engine did not complete Dead-KV reclamation on every rank",
+                    "engine_result": self._normalize_result(result),
+                }
+                return
+            yield {
+                "status": "success",
+                "program_id": program_id,
+                "engine_result": self._normalize_result(result),
+            }
+        except Exception as exc:
+            logging.exception("Failed to end aginfer program %s", program_id)
+            yield {
+                "status": "error",
+                "program_id": program_id,
+                "message": str(exc),
+            }
 
     async def release_memory_occupation(self, body: dict) -> dict:
         """Release GPU memory occupation and unregister from discovery.

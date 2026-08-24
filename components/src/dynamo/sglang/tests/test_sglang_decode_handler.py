@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
+from dynamo.common.constants import DisaggregationMode
 from dynamo.common.metadata_upload import MetadataUploader
 from dynamo.sglang.request_handlers.llm.decode_handler import (
     DecodeWorkerHandler,
@@ -220,14 +222,233 @@ def _new_decode_handler(*, use_sglang_tokenizer: bool = False, enable_rl: bool =
     return handler
 
 
+def test_program_id_kwargs_prefers_session_id_and_accepts_legacy_alias():
+    class Engine:
+        async def async_generate(self, *, program_id=None):
+            return program_id
+
+    handler = _new_decode_handler()
+    handler.engine = Engine()
+
+    assert handler._program_id_kwargs(
+        {
+            "agent_context": {
+                "session_id": "session-new",
+                "trajectory_id": "trajectory-old",
+            }
+        }
+    ) == {"program_id": "session-new"}
+    assert handler._program_id_kwargs(
+        {"agent_context": {"trajectory_id": "trajectory-old"}}
+    ) == {"program_id": "trajectory-old"}
+
+
+def test_program_id_kwargs_fails_instead_of_silently_dropping_identity():
+    class StockEngine:
+        async def async_generate(self, *, stream=False):
+            return stream
+
+    handler = _new_decode_handler()
+    handler.engine = StockEngine()
+
+    with pytest.raises(RuntimeError, match="aginfer-enabled SGLang"):
+        handler._program_id_kwargs({"agent_context": {"session_id": "session-1"}})
+
+
+@pytest.mark.asyncio
+async def test_end_program_waits_for_async_engine_ack():
+    calls = []
+
+    class Engine:
+        async def async_end_program(self, program_id, session_id=None):
+            calls.append((program_id, session_id))
+            return [
+                {
+                    "ok": True,
+                    "deferred": False,
+                    "released_hbm_tokens": 42,
+                }
+            ]
+
+        def end_program(self, program_id, session_id=None):
+            raise AssertionError("sync fallback must not run when async API exists")
+
+    handler = _new_decode_handler()
+    handler.engine = Engine()
+
+    result = [item async for item in handler.end_program({"program_id": " session-1 "})]
+
+    assert calls == [("session-1", "session-1")]
+    assert result == [
+        {
+            "status": "success",
+            "program_id": "session-1",
+            "engine_result": {
+                "result": [
+                    {
+                        "ok": True,
+                        "deferred": False,
+                        "released_hbm_tokens": 42,
+                    }
+                ]
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_end_program_runs_sync_fallback_off_the_event_loop_thread():
+    event_loop_thread = threading.get_ident()
+    calls = []
+
+    class Engine:
+        def end_program(self, program_id, session_id=None):
+            calls.append((program_id, session_id, threading.get_ident()))
+            return [{"ok": True, "deferred": False}]
+
+    handler = _new_decode_handler()
+    handler.engine = Engine()
+
+    result = [item async for item in handler.end_program({"program_id": "session-1"})]
+
+    assert calls[0][0] == "session-1"
+    assert calls[0][1] == "session-1"
+    assert calls[0][2] != event_loop_thread
+    assert result[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_end_program_rejects_deferred_engine_ack():
+    class Engine:
+        async def async_end_program(self, program_id, session_id=None):
+            return [{"ok": True, "deferred": True, "status": "deferred"}]
+
+    handler = _new_decode_handler()
+    handler.engine = Engine()
+
+    result = [item async for item in handler.end_program({"program_id": "session-1"})]
+
+    assert result[0]["status"] == "error"
+    assert "did not complete" in result[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_end_program_reports_missing_engine_contract():
+    handler = _new_decode_handler()
+    handler.engine = SimpleNamespace()
+
+    result = [item async for item in handler.end_program({"program_id": "session-1"})]
+
+    assert result[0]["status"] == "error"
+    assert "end_program(program_id)" in result[0]["message"]
+
+
 async def _stream(items):
     for item in items:
         yield item
 
 
 class _Context:
+    trace_id = "trace-id"
+
+    def id(self):
+        return "context-id"
+
+    def trace_headers(self):
+        return {}
+
     def is_stopped(self):
         return False
+
+
+class _RecordingEngine:
+    def __init__(self):
+        self.calls = []
+
+    async def async_generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return _stream(
+            [
+                {
+                    "index": 0,
+                    "output_ids": [],
+                    "meta_info": {
+                        "id": "request-1",
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+            ]
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "serving_mode",
+    [DisaggregationMode.AGGREGATED, DisaggregationMode.DECODE],
+)
+async def test_decode_paths_forward_agent_session_as_program_id(serving_mode):
+    engine = _RecordingEngine()
+    handler = _new_decode_handler()
+    handler.engine = engine
+    handler.serving_mode = serving_mode
+    handler.enable_trace = False
+    handler._engine_supports_priority = False
+    handler._routed_experts_kwargs = {}
+    handler._enable_frontend_decoding = False
+    handler._mm_hashes_supported = False
+    handler.lora_id_for_name = {}
+    handler._get_input_param = lambda request: {"input_ids": request["token_ids"]}
+
+    request = {
+        "token_ids": [1, 2],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 1},
+        "agent_context": {"session_id": "session-1"},
+    }
+    if serving_mode == DisaggregationMode.DECODE:
+        request["bootstrap_info"] = {
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": 1234,
+            "bootstrap_room": 99,
+        }
+
+    await _collect(handler.generate(request, _Context()))
+
+    assert engine.calls[0]["program_id"] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_prefill_path_forwards_agent_session_as_program_id():
+    engine = _RecordingEngine()
+    handler = PrefillWorkerHandler.__new__(PrefillWorkerHandler)
+    handler.engine = engine
+    handler.bootstrap_host = "127.0.0.1"
+    handler.bootstrap_port = 1234
+    handler.enable_trace = False
+    handler._engine_supports_priority = False
+    handler.lora_id_for_name = {}
+    handler._consume_tasks = set()
+    handler._get_input_param = lambda request: {"input_ids": request["token_ids"]}
+
+    @asynccontextmanager
+    async def no_cancellation_monitor(*args, **kwargs):
+        yield None
+
+    handler._cancellation_monitor = no_cancellation_monitor
+
+    await _collect(
+        handler.generate(
+            {
+                "token_ids": [1, 2],
+                "sampling_options": {},
+                "stop_conditions": {"max_tokens": 1},
+                "agent_context": {"session_id": "session-1"},
+            },
+            _Context(),
+        )
+    )
+
+    assert engine.calls[0]["program_id"] == "session-1"
 
 
 def test_build_sampling_params_passes_n_for_token_requests():
