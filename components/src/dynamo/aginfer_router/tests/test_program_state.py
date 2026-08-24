@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from dynamo.thunderagent_router.program_state import (
+from dynamo.aginfer_router.program_state import (
     ProgramLifecycle,
     ProgramStatus,
     ProgramTable,

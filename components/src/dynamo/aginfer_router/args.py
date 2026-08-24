@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from typing import Optional
 
+from dynamo.aginfer_router.router import ThunderAgentConfig
 from dynamo.common.configuration.arg_group import ArgGroup
 from dynamo.common.configuration.utils import add_argument
 from dynamo.router.args import (
@@ -16,7 +17,6 @@ from dynamo.router.args import (
     build_aic_perf_config,
     build_kv_router_config,
 )
-from dynamo.thunderagent_router.router import ThunderAgentConfig
 
 
 class ThunderAgentRouterConfig(DynamoRouterConfig):

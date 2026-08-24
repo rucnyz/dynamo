@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Bring up the thunderagent_router MiniMax-M2 eval stack on a single 8xH100
+# Bring up the aginfer_router MiniMax-M2 scheduler eval stack on a single 8xH100
 # node: two TP4 vLLM workers (GPUs 0-3 and 4-7) + the program-aware router +
 # the frontend on :8100. Hardcoded for that one config -- nothing else.
 #
@@ -32,7 +32,7 @@ DYN_SYSTEM_PORT=8082 CUDA_VISIBLE_DEVICES=4,5,6,7 python -m dynamo.vllm \
 
 # Program-aware router: registers the model handler and forwards the parser so
 # MiniMax's <minimax:tool_call> XML reaches the agent as OpenAI tool_calls.
-python -m dynamo.thunderagent_router \
+python -m dynamo.aginfer_router \
     --endpoint dynamo.vllm.generate \
     --model-name "$MODEL" \
     --dyn-tool-call-parser minimax_m2 \

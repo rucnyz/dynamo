@@ -13,18 +13,36 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
-from dynamo.thunderagent_router.program_state import (
+from dynamo.aginfer_router.program_state import (
     Program,
     ProgramLifecycle,
     ProgramStatus,
     ProgramTable,
 )
 
+if TYPE_CHECKING:
+    from dynamo.aginfer_router.capacity import WorkerCapacityProvider
+
 logger = logging.getLogger(__name__)
+
+_TERMINATED_TOMBSTONE_TTL_SECONDS = 3600.0
+_MAX_TERMINATED_TOMBSTONES = 100_000
+
+
+class ProgramTerminatedError(RuntimeError):
+    """Raised when work arrives after a program's terminal notification."""
+
+
+class ProgramNotFoundError(RuntimeError):
+    """Raised when a terminal notification has no routing history."""
+
+
+class DisaggregatedCleanupUnsupportedError(RuntimeError):
+    """Raised when terminal cleanup would cross Dynamo worker components."""
 
 
 @dataclass
@@ -64,6 +82,7 @@ class ThunderAgentScheduler:
         self._lock = asyncio.Lock()
         self._scheduler_task: Optional[asyncio.Task] = None
         self._stat_forced_resumes = 0
+        self._terminated: OrderedDict[str, float] = OrderedDict()
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -97,17 +116,18 @@ class ThunderAgentScheduler:
                 program_id, estimated_prompt_tokens
             )
 
-        if wait_event is not None:
-            try:
+        try:
+            if wait_event is not None:
                 await asyncio.wait_for(
                     wait_event.wait(), timeout=self._cfg.resume_timeout_seconds
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Forced resume for %s after %.1fs",
-                    program_id,
-                    self._cfg.resume_timeout_seconds,
-                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Forced resume for %s after %.1fs",
+                program_id,
+                self._cfg.resume_timeout_seconds,
+            )
+            try:
                 async with self._lock:
                     program = self._table.programs.get(program_id)
                     if (
@@ -119,27 +139,47 @@ class ThunderAgentScheduler:
                         )
                         self._resume_program(program, worker_id)
                         self._stat_forced_resumes += 1
+            except BaseException:
+                await self._cancel_admission(program_id)
+                raise
+        except BaseException:
+            await self._cancel_admission(program_id)
+            raise
 
-        waited = time.monotonic() - wait_started
+        try:
+            waited = time.monotonic() - wait_started
 
+            async with self._lock:
+                program = self._table.programs.get(program_id)
+                if (
+                    program is None
+                    or program.lifecycle == ProgramLifecycle.TERMINATED
+                    or self._is_terminated_locked(program_id)
+                ):
+                    raise ProgramTerminatedError(
+                        f"program {program_id!r} has already been terminated"
+                    )
+
+                priority_jump = self._cfg.resume_priority_boost if was_paused else 0.0
+                soft_demoted = program.soft_demoted_until > time.monotonic()
+                if soft_demoted:
+                    priority_jump += self._cfg.soft_demote_priority_jump
+
+                return PauseDecision(
+                    program_id=program_id,
+                    priority_jump=priority_jump,
+                    waited_seconds=waited,
+                    was_paused=was_paused,
+                    was_soft_demoted=soft_demoted,
+                    assigned_worker_hint=program.assigned_worker_id,
+                )
+        except BaseException:
+            await self._cancel_admission(program_id)
+            raise
+
+    async def _cancel_admission(self, program_id: str) -> None:
         async with self._lock:
-            program = self._table.programs.get(program_id)
-            if program is None:
-                return PauseDecision(program_id=program_id, waited_seconds=waited)
-
-            priority_jump = self._cfg.resume_priority_boost if was_paused else 0.0
-            soft_demoted = program.soft_demoted_until > time.monotonic()
-            if soft_demoted:
-                priority_jump += self._cfg.soft_demote_priority_jump
-
-            return PauseDecision(
-                program_id=program_id,
-                priority_jump=priority_jump,
-                waited_seconds=waited,
-                was_paused=was_paused,
-                was_soft_demoted=soft_demoted,
-                assigned_worker_hint=program.assigned_worker_id,
-            )
+            self._table.cancel_request(program_id)
 
     def _admit_locked(
         self,
@@ -147,6 +187,13 @@ class ThunderAgentScheduler:
         estimated_prompt_tokens: int,
     ) -> tuple[Optional[asyncio.Event], bool]:
         # Caller holds self._lock.
+        existing = self._table.programs.get(program_id)
+        if self._is_terminated_locked(program_id) or (
+            existing is not None and existing.lifecycle == ProgramLifecycle.TERMINATED
+        ):
+            raise ProgramTerminatedError(
+                f"program {program_id!r} has already been terminated"
+            )
         was_new = program_id not in self._table.programs
         program = self._table.begin_request(program_id, estimated_prompt_tokens)
         if program.lifecycle == ProgramLifecycle.PAUSED:
@@ -168,6 +215,7 @@ class ThunderAgentScheduler:
         )
         if worker_id is not None:
             program.assigned_worker_id = worker_id
+            program.kv_worker_ids.add(worker_id)
             return None, False
 
         # All workers full: queue until the scheduler tick resumes us.
@@ -202,7 +250,10 @@ class ThunderAgentScheduler:
             )
             if program is None:
                 return
-            if program.marked_for_pause:
+            if (
+                program.lifecycle != ProgramLifecycle.TERMINATED
+                and program.marked_for_pause
+            ):
                 program.marked_for_pause = False
                 do_pause = True
 
@@ -210,10 +261,95 @@ class ThunderAgentScheduler:
             await self._pause_acting(program_id)
 
     async def assign_worker(self, program_id: str, worker_id: int) -> None:
+        await self.assign_workers(program_id, decode_worker_id=worker_id)
+
+    async def assign_workers(
+        self,
+        program_id: str,
+        *,
+        decode_worker_id: Optional[int] = None,
+        prefill_worker_id: Optional[int] = None,
+    ) -> None:
+        """Record worker attribution needed by terminal cleanup."""
         async with self._lock:
             program = self._table.programs.get(program_id)
             if program is not None:
-                program.assigned_worker_id = worker_id
+                if (
+                    prefill_worker_id is not None
+                    and prefill_worker_id != decode_worker_id
+                ):
+                    program.disaggregated_workers_observed = True
+                if decode_worker_id is not None:
+                    program.assigned_worker_id = decode_worker_id
+                    program.kv_worker_ids.add(decode_worker_id)
+                elif prefill_worker_id is not None:
+                    # Aggregated responses normally populate both fields with
+                    # the same id. Retain this fallback for older bindings that
+                    # report only the active worker in the prefill slot.
+                    program.assigned_worker_id = prefill_worker_id
+                    program.kv_worker_ids.add(prefill_worker_id)
+
+    async def worker_ids_for_program(
+        self, program_id: str
+    ) -> Optional[tuple[int, ...]]:
+        """Return workers that may retain this program's KV.
+
+        ``None`` means the program is already absent (making a duplicate end
+        notification idempotent).  An empty tuple means the program is known,
+        but no worker attribution was ever observed; callers must not release
+        the local mapping in that case because doing so would orphan KV.
+        """
+        async with self._lock:
+            program = self._table.programs.get(program_id)
+            if program is None:
+                return None
+            if program.disaggregated_workers_observed:
+                raise DisaggregatedCleanupUnsupportedError(
+                    "Dead-KV cleanup currently supports aggregated SGLang only; "
+                    f"program {program_id!r} used distinct prefill/decode workers"
+                )
+            worker_ids = set(program.kv_worker_ids)
+            if program.assigned_worker_id is not None:
+                worker_ids.add(program.assigned_worker_id)
+            return tuple(sorted(worker_ids))
+
+    async def begin_end_program(self, program_id: str) -> Optional[tuple[int, ...]]:
+        """Close admission, drain active requests, then snapshot KV workers.
+
+        The program remains in the table until :meth:`end_program` is called,
+        so a failed worker cleanup can be retried without losing its routing
+        history. New work and paused waiters fail closed as soon as this method
+        marks the lifecycle terminal.
+        """
+        async with self._lock:
+            program = self._table.programs.get(program_id)
+            if program is None:
+                if self._is_terminated_locked(program_id):
+                    return None
+                raise ProgramNotFoundError(f"cannot end unknown program {program_id!r}")
+            self._mark_terminated_locked(program_id)
+            program.lifecycle = ProgramLifecycle.TERMINATED
+            self._table.paused.pop(program_id, None)
+            if program.waiting is not None:
+                program.waiting.set()
+                program.waiting = None
+            drained = program.drained
+
+        await drained.wait()
+
+        async with self._lock:
+            program = self._table.programs.get(program_id)
+            if program is None:
+                return None
+            if program.disaggregated_workers_observed:
+                raise DisaggregatedCleanupUnsupportedError(
+                    "Dead-KV cleanup currently supports aggregated SGLang only; "
+                    f"program {program_id!r} used distinct prefill/decode workers"
+                )
+            worker_ids = set(program.kv_worker_ids)
+            if program.assigned_worker_id is not None:
+                worker_ids.add(program.assigned_worker_id)
+            return tuple(sorted(worker_ids))
 
     async def _scheduler_loop(self) -> None:
         consecutive_failures = 0
@@ -396,18 +532,14 @@ class ThunderAgentScheduler:
             if program.marked_for_pause:
                 continue
             if program.status == ProgramStatus.ACTING:
-                if (
-                    smallest_acting is None
-                    or self._program_value(program)
-                    < self._program_value(smallest_acting)
-                ):
+                if smallest_acting is None or self._program_value(
+                    program
+                ) < self._program_value(smallest_acting):
                     smallest_acting = program
             elif program.status == ProgramStatus.REASONING:
-                if (
-                    smallest_reasoning is None
-                    or self._program_value(program)
-                    < self._program_value(smallest_reasoning)
-                ):
+                if smallest_reasoning is None or self._program_value(
+                    program
+                ) < self._program_value(smallest_reasoning):
                     smallest_reasoning = program
         return smallest_acting, smallest_reasoning
 
@@ -445,6 +577,7 @@ class ThunderAgentScheduler:
             program = self._table.programs.get(program_id)
             if program is None:
                 return False
+            self._mark_terminated_locked(program_id)
             program.lifecycle = ProgramLifecycle.TERMINATED
             if program.waiting is not None:
                 program.waiting.set()  # unblock any coroutine paused on this program
@@ -456,6 +589,27 @@ class ThunderAgentScheduler:
                 len(self._table.programs),
             )
             return True
+
+    def _is_terminated_locked(self, program_id: str) -> bool:
+        # Caller holds self._lock.
+        deadline = self._terminated.get(program_id)
+        if deadline is None:
+            return False
+        if deadline <= time.monotonic():
+            self._terminated.pop(program_id, None)
+            return False
+        self._terminated.move_to_end(program_id)
+        return True
+
+    def _mark_terminated_locked(self, program_id: str) -> None:
+        # Caller holds self._lock. Bound memory while retaining enough history
+        # to reject delayed/retried requests that reuse a closed session id.
+        self._terminated[program_id] = (
+            time.monotonic() + _TERMINATED_TOMBSTONE_TTL_SECONDS
+        )
+        self._terminated.move_to_end(program_id)
+        while len(self._terminated) > _MAX_TERMINATED_TOMBSTONES:
+            self._terminated.popitem(last=False)
 
     async def _greedy_resume(self, capacities: dict[int, int]) -> None:
         if not self._table.paused:
@@ -548,6 +702,8 @@ class ThunderAgentScheduler:
             return
         program.lifecycle = ProgramLifecycle.ACTIVE
         program.assigned_worker_id = target_worker_id
+        if target_worker_id is not None:
+            program.kv_worker_ids.add(target_worker_id)
         notify = program.waiting
         program.waiting = None
         self._table.paused.pop(program.program_id, None)

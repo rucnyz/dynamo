@@ -3,6 +3,18 @@
 
 """ThunderAgent program scheduler inside a Dynamo router service."""
 
-from dynamo.thunderagent_router.router import PauseDecision, ThunderAgentScheduler
+from dynamo.aginfer_router.router import (
+    DisaggregatedCleanupUnsupportedError,
+    PauseDecision,
+    ProgramNotFoundError,
+    ProgramTerminatedError,
+    ThunderAgentScheduler,
+)
 
-__all__ = ["PauseDecision", "ThunderAgentScheduler"]
+__all__ = [
+    "DisaggregatedCleanupUnsupportedError",
+    "PauseDecision",
+    "ProgramNotFoundError",
+    "ProgramTerminatedError",
+    "ThunderAgentScheduler",
+]

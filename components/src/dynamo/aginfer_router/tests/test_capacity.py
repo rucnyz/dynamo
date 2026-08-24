@@ -10,7 +10,7 @@ from typing import Optional
 
 import pytest
 
-from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
+from dynamo.aginfer_router.capacity import WorkerCapacityProvider
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
 

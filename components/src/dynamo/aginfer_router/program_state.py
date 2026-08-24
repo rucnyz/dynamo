@@ -36,6 +36,16 @@ class Program:
 
     assigned_worker_id: Optional[int] = None
 
+    # Every aggregated worker that may still hold KV for this program.  The
+    # active ``assigned_worker_id`` is cleared when a program is paused/moved,
+    # but a terminal notification still has to reach the old worker so it can
+    # drop the program's cache.
+    kv_worker_ids: set[int] = field(default_factory=set)
+
+    # The current control-plane client is scoped to one Dynamo component.
+    # Distinct prefill/decode workers therefore cannot be cleaned safely yet.
+    disaggregated_workers_observed: bool = False
+
     token_total: int = 0
 
     step_count: int = 0
@@ -43,6 +53,13 @@ class Program:
     # monotonic seconds; >0 means priority demotion active
     soft_demoted_until: float = 0.0
     waiting: Optional[asyncio.Event] = field(default=None, repr=False)
+
+    # Requests that passed admission but have not yet run ``after_request``.
+    # A terminal notification waits for this count to reach zero before it
+    # snapshots the KV-worker set, otherwise a concurrently streaming request
+    # can publish a new worker after cleanup has already been acknowledged.
+    inflight_requests: int = 0
+    drained: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     # monotonic seconds; used to compute resume-side decay
     acting_since: float = 0.0
@@ -67,6 +84,8 @@ class ProgramTable:
             program.token_total = estimated_prompt_tokens
         program.status = ProgramStatus.REASONING
         program.acting_since = 0.0
+        program.inflight_requests += 1
+        program.drained.clear()
         return program
 
     def end_request(
@@ -75,9 +94,24 @@ class ProgramTable:
         program = self.programs.get(program_id)
         if program is None:
             return None
+        if program.inflight_requests > 0:
+            program.inflight_requests -= 1
+        if program.inflight_requests == 0:
+            program.drained.set()
         program.token_total = prompt_tokens + completion_tokens
         program.status = ProgramStatus.ACTING
         program.acting_since = time.monotonic()
+        return program
+
+    def cancel_request(self, program_id: str) -> Optional[Program]:
+        """Undo an admission that is rejected by a concurrent terminal event."""
+        program = self.programs.get(program_id)
+        if program is None:
+            return None
+        if program.inflight_requests > 0:
+            program.inflight_requests -= 1
+        if program.inflight_requests == 0:
+            program.drained.set()
         return program
 
     def release(self, program_id: str) -> Optional[Program]:

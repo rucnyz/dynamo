@@ -43,54 +43,60 @@ python -m dynamo.aginfer_router \
     --router-block-size 64
 ```
 
-Pause/resume is opt-in per request via `nvext.agent_context.trajectory_id`
-(requests without it route through a plain `KvRouter`).
+Pause/resume is opt-in per request via `agent_context.session_id` (requests
+without it route through a plain `KvRouter`).  Legacy replay producers using
+`trajectory_id` / `trajectory_final` are accepted at the aginfer boundary and
+normalized to Dynamo's canonical `session_id` / `session_final` fields.
+
+Terminal requests (`session_final=true` or
+`kv_hints.evict_session=true`) are sent to the dedicated sibling worker
+endpoint `end_program`. In aggregated serving, the router directly targets
+every SGLang worker previously attributed to the program and releases its
+local mapping only after all workers acknowledge cleanup. The required
+SGLang contract is an idempotent `Engine.async_end_program(program_id)` method.
+The Dynamo worker also supports a legacy synchronous
+`Engine.end_program(program_id)` fallback, executed outside the active asyncio
+loop.
+
+This explicit Dead-KV reclamation path currently requires an aggregated,
+aginfer-enabled SGLang backend. Other backends can still use the value-aware
+scheduling path, but a terminal request fails closed if their worker does not
+expose `end_program`. Disaggregated prefill/decode cleanup is also fail-closed:
+the router retains the mapping when it observes distinct worker components,
+because Dynamo direct dispatch is endpoint-scoped.
+
+## Dead-KV lifecycle
+
+The full lifecycle is split across Dynamo and SGLang:
+
+1. Dynamo normalizes legacy trajectory metadata to the canonical session fields and
+   forwards `session_id` to every SGLang generate path as `program_id`.
+2. The router records every aggregated worker that may retain KV for the program.
+   Historical workers remain in the cleanup set after migration.
+3. A terminal request closes admission and waits for already-admitted requests to
+   finish before taking the worker snapshot.
+4. The router directly invokes each worker's `end_program` endpoint. Each worker waits
+   for all SGLang ranks to report completed reclamation.
+5. Only after every worker acknowledges cleanup does the router remove the sticky
+   mapping. Partial failure retains the mapping so the terminal request can be retried.
+
+Completed sessions are kept in a bounded, expiring tombstone table. Duplicate terminal
+requests are idempotent, while new inference requests that reuse a recently ended
+session ID fail closed.
 
 ## Why this lives here
 
-aginfer is a program-aware, value-driven KV **scheduler** that currently runs as an
-external daemon + in-engine eviction scorer on sglang HiCache + mooncake. Dynamo is the
-one stack that natively carries program/session identity (`nvext.agent_context`) at the
-orchestrator **and** owns a multi-tier KV substrate -- so aginfer's orchestration-side
-levers (value-gated pause/resume, worker placement, predictive promote) attach here as an
-**additive component**, exactly the pattern ThunderAgent established. The in-cache
-value-eviction lever stays engine-side (sglang scorer), forwarded via the priority scalar.
+Dynamo owns request/session identity and worker placement, so it is the only layer that
+can identify every worker that may hold a program's KV. SGLang owns the physical HBM and
+host-cache allocations, so it performs the actual leaf-to-root reclamation. Keeping the
+two responsibilities explicit avoids treating a fake inference request as a lifecycle
+signal and gives the router a concrete acknowledgement before it forgets the mapping.
+
+The value-aware pause/resume policy remains an additive scheduling layer on top of
+Dynamo's native KV router. The engine-side cache policy remains in the aginfer SGLang
+fork and receives the stable `program_id` forwarded by this component.
 
 ---
 
 Derived from `dynamo.thunderagent_router` (Apache-2.0, NVIDIA) — the pause/resume/BFD
 machinery is theirs; the value gate (`_program_value` + the ordering swaps) is aginfer's.
-
----
-
-## #251 step 5 — value-aware admission (engine-state ingestion)
-
-The verified #251 split puts MIGRATION in the engine and ADMISSION (pause/resume) HERE at the
-router. Today this router's pause decision uses a token-size proxy (`_program_value`); step 5
-makes it value-aware by reading the engine's real value state — **reusing the in-engine
-`build_paper_state` + `admission_controller` directly** (the router runs with the sglang fork on
-its PYTHONPATH; single source, no copy). Confirmed feasible: the router CAN import
-`sglang.srt.mem_cache.aginfer.{state_builder,admission_controller}`.
-
-Ordered plan (foundation → live-path; the high-risk steps need a stabilized sglang-backed stack):
-1. **`engine_state.py` — DONE (increment 1, 10 server-free tests).** Async GET `/aginfer/state`
-   → the engine's real `SchedulerState` via in-engine `build_paper_state` (synthetic
-   MEMORY_PRESSURE event). DO-NO-HARM: `None` when no `--aginfer-state-url` / unreachable /
-   non-sglang backend ⇒ router falls back to the size proxy. Tick-cached (NOT per-request — the
-   dump is 5-50ms, #160).
-2. wire a `--aginfer-state-url` arg (`args.py`) + a tick-driven snapshot refresh in the scheduler
-   loop (the cached `SchedulerState`).
-3. swap `_program_value` → in-engine `admission_controller.shared_aware_prog_scores` (fleet,
-   holder-split) when state present; size proxy when absent. Replace watermark pause-victim
-   selection with `pause_candidates` (cost vs shadow-price `pause_relief`). **high risk.**
-4. gate the ingress `asyncio.Event` on the engine's `per_program_usage[pid].state == PAUSED`
-   (not just router-local lifecycle); port `_gated_count` + resume-in-flight dedup (#215) +
-   ended-while-gated 499 (#183). **high risk — distributed state authority / lag.**
-5. SESSION_END / disconnect on the gate; expose theta_hi/lo/heartbeat for `capacity_fits`/`forecast`.
-
-Hard problems (see the step-5 map): backend must be sglang (vLLM has no `/aginfer/state`);
-router↔engine state-lag authority (avoid double-pause/strand); `pause_relief` needs the engine's
-D_t (conservative `exclude={}` until plumbed); pause-thrash on stale state (regime-dependent win,
-do-no-harm floor is not) ⇒ the value path must be provably no-worse-than the size baseline when
-state is stale/absent. Live goodput-vs-ThunderAgent A/B (moderate concurrency, N≥3 paired) runs
-only after the unit layer is green AND on a stabilized stack (V4 is crash-prone under flood).

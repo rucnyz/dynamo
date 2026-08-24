@@ -12,8 +12,14 @@ from typing import Optional
 
 import pytest
 
-from dynamo.thunderagent_router.program_state import ProgramLifecycle, ProgramStatus
-from dynamo.thunderagent_router.router import ThunderAgentConfig, ThunderAgentScheduler
+from dynamo.aginfer_router.program_state import ProgramLifecycle, ProgramStatus
+from dynamo.aginfer_router.router import (
+    DisaggregatedCleanupUnsupportedError,
+    ProgramNotFoundError,
+    ProgramTerminatedError,
+    ThunderAgentConfig,
+    ThunderAgentScheduler,
+)
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
 
@@ -79,6 +85,45 @@ async def test_assigned_worker_hint_reflects_sticky_assignment():
 
 
 @pytest.mark.asyncio
+async def test_worker_ids_for_program_tracks_aggregated_and_old_placements():
+    router, _ = make_router()
+    await router.before_request("p1")
+    await router.assign_workers("p1", decode_worker_id=3, prefill_worker_id=3)
+
+    # A resume/migration changes the active sticky route but must not discard
+    # workers that can still retain older KV for terminal cleanup.
+    async with router._lock:
+        router._table.programs["p1"].lifecycle = ProgramLifecycle.PAUSED
+        router._table.programs["p1"].assigned_worker_id = None
+        router._resume_program(router._table.programs["p1"], target_worker_id=5)
+
+    assert await router.worker_ids_for_program("p1") == (3, 5)
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_cleanup_fails_closed_and_retains_mapping():
+    router, _ = make_router()
+    await router.before_request("p1")
+    await router.assign_workers("p1", decode_worker_id=3, prefill_worker_id=7)
+    await router.after_request("p1", prompt_tokens=100, completion_tokens=1)
+
+    with pytest.raises(DisaggregatedCleanupUnsupportedError, match="aggregated"):
+        await router.begin_end_program("p1")
+
+    assert "p1" in router._table.programs
+    assert router._table.programs["p1"].lifecycle == ProgramLifecycle.TERMINATED
+
+
+@pytest.mark.asyncio
+async def test_worker_ids_for_program_distinguishes_unknown_from_unattributed():
+    router, _ = make_router()
+
+    assert await router.worker_ids_for_program("missing") is None
+    await router.before_request("known")
+    assert await router.worker_ids_for_program("known") == ()
+
+
+@pytest.mark.asyncio
 async def test_pause_acting_then_before_request_blocks_until_resume():
     cfg = ThunderAgentConfig(
         scheduler_interval_seconds=0.05,
@@ -103,6 +148,76 @@ async def test_pause_acting_then_before_request_blocks_until_resume():
     assert decision.was_paused is True
     assert decision.priority_jump == cfg.resume_priority_boost
     assert decision.assigned_worker_hint == 1
+
+
+@pytest.mark.asyncio
+async def test_end_program_wakes_paused_waiter_and_rejects_it():
+    router, _ = make_router()
+    await router.before_request("p1")
+    await router.after_request("p1", prompt_tokens=100, completion_tokens=0)
+    await router._pause_acting("p1")
+
+    waiter = asyncio.create_task(router.before_request("p1"))
+    await asyncio.sleep(0)
+    worker_ids = await router.begin_end_program("p1")
+    assert worker_ids == ()
+
+    with pytest.raises(ProgramTerminatedError):
+        await waiter
+    assert router._table.programs["p1"].inflight_requests == 0
+
+    assert await router.end_program("p1") is True
+    with pytest.raises(ProgramTerminatedError):
+        await router.before_request("p1")
+
+
+@pytest.mark.asyncio
+async def test_begin_end_waits_for_inflight_then_snapshots_latest_worker():
+    router, _ = make_router()
+    await router.before_request("p1")
+
+    closing = asyncio.create_task(router.begin_end_program("p1"))
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    # This attribution can arrive from the already-admitted streaming request
+    # after the terminal notification started. It must be in the cleanup set.
+    await router.assign_worker("p1", 17)
+    await router.after_request("p1", prompt_tokens=100, completion_tokens=1)
+    assert await asyncio.wait_for(closing, timeout=1.0) == (17,)
+
+    with pytest.raises(ProgramTerminatedError):
+        await router.before_request("p1")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_paused_admission_does_not_block_terminal_drain():
+    router, _ = make_router()
+    await router.before_request("p1")
+    await router.after_request("p1", prompt_tokens=100, completion_tokens=0)
+    await router._pause_acting("p1")
+
+    waiter = asyncio.create_task(router.before_request("p1"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert router._table.programs["p1"].inflight_requests == 0
+    assert await asyncio.wait_for(router.begin_end_program("p1"), timeout=1.0) == ()
+
+
+@pytest.mark.asyncio
+async def test_unknown_final_fails_closed_but_tombstoned_duplicate_is_noop():
+    router, _ = make_router()
+    with pytest.raises(ProgramNotFoundError):
+        await router.begin_end_program("never-seen")
+
+    await router.before_request("known")
+    await router.after_request("known", prompt_tokens=1, completion_tokens=0)
+    assert await router.begin_end_program("known") == ()
+    assert await router.end_program("known") is True
+    assert await router.begin_end_program("known") is None
 
 
 @pytest.mark.asyncio
