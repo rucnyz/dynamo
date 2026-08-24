@@ -313,12 +313,15 @@ text-to-video-diffusion.sh  # 1-2 GPUs - Text-to-video (Wan2.1)
   Always slice with an offset, don't assume per-chunk logprobs.
 - **Zombie GPU processes**: `sgl_diffusion::scheduler` spawns a child process that
   survives parent kill. Always check `nvidia-smi` after teardown.
-- **Session identity**: SGLang 0.5.15 supports passive session-aware radix
-  ownership through the top-level `session_id` request field, but Dynamo does
-  not forward `agent_context.session_id` to it yet. Do not pass that value as
-  `session_params.id`; SGLang treats that field as an explicit session lifecycle
-  and rejects IDs that were not created through `open_session`. Session headers
-  remain available for tracing and router affinity.
+- **Session identity**: the decode handler forwards `agent_context.session_id` to
+  the engine as `async_generate(program_id=...)`, which is what tags each radix
+  node's `session_ids` and so populates the engine's `per_program_usage`. Without
+  it the engine's program accounting is empty and any value-aware policy reading
+  it silently sees nothing to score. The kwarg is probed off the engine signature
+  at init (only the aginfer fork declares it), and requests with no session id
+  send nothing. Do **not** pass the value as `session_params.id`: SGLang treats
+  that field as an explicit session lifecycle and rejects IDs not created through
+  `open_session`.
 
 For troubleshooting (CuDNN, config.json errors, OOM, disagg connectivity), see
 `docs/backends/sglang/sglang-examples.md#troubleshooting`.

@@ -55,6 +55,19 @@ def _extract_program_id(request: dict[str, Any]) -> Optional[str]:
     return extract_program_id(request)
 
 
+def _extract_parent_program_id(request: dict[str, Any]) -> Optional[str]:
+    """``agent_context.parent_session_id`` -- the session that spawned this one
+    as a sub-agent. Fed to the scheduler's value gate, which scores a program
+    with live sub-agents higher (it will be re-entered when they return).
+    Unused by the request plane otherwise.
+    """
+    ctx = request.get("agent_context")
+    if not isinstance(ctx, dict):
+        return None
+    pid = ctx.get("parent_session_id")
+    return pid if isinstance(pid, str) and pid else None
+
+
 def _is_trajectory_final(request: dict[str, Any]) -> bool:
     """Return true for canonical or legacy terminal lifecycle metadata."""
     return is_program_final(request)
@@ -209,6 +222,7 @@ class ThunderAgentRouterHandler:
         decision = await self._scheduler.before_request(
             program_id,
             estimated_prompt_tokens=estimated_prompt_tokens,
+            parent_program_id=_extract_parent_program_id(request),
         )
         try:
             worker_pin = decision.assigned_worker_hint

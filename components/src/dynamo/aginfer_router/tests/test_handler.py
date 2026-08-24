@@ -150,7 +150,9 @@ async def test_normal_request_normalizes_legacy_context_and_records_pd_workers()
     calls = []
 
     class Scheduler:
-        async def before_request(self, program_id, estimated_prompt_tokens=0):
+        async def before_request(
+            self, program_id, estimated_prompt_tokens=0, parent_program_id=None
+        ):
             calls.append(("before", program_id, estimated_prompt_tokens))
             return SimpleNamespace(priority_jump=0.0, assigned_worker_hint=None)
 

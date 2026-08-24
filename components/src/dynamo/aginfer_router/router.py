@@ -1,11 +1,38 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ThunderAgent program scheduler: native port of upstream TA's algorithm.
+"""ThunderAgent program scheduler, with value (not size) as the pause/resume gate.
 
-Pause-smallest-ACTING-first; BFD restore; exponential decay on the resume
+Pause-least-valuable-ACTING-first; BFD restore; exponential decay on the resume
 side. v0 reads real token counts from chat-completions ``usage`` instead of
 upstream's ``chars / 5`` proxy estimator.
+
+ThunderAgent schedules on working-set SIZE -- it pauses the smallest ACTING
+program and restores smallest-first, because size is all it knows. This
+scheduler keeps that machinery (the watermarks, the soft-demote band, the BFD
+placement pass, the forced-resume timeout, SESSION_END/Dead-KV cleanup) and
+overrides exactly two ordering keys with a per-program value ``V_u``:
+
+    * which program to pause under pressure -> LOWEST value, not smallest
+    * which paused program to resume        -> smallest first by default,
+      unchanged from ThunderAgent; HIGHEST value first is opt-in via
+      ``value_ordered_resume`` (off by default: the ceiling admits a fixed
+      token budget per tick, and value-ordering it stalls the backlog --
+      see ``_resume_selection_key``)
+
+``V_u`` comes from whichever signal is available, best first:
+
+    1. the engine's own value state (``--aginfer-state-url``), whose
+       ``shared_aware_prog_scores`` splits each cache block's value across the
+       sessions holding it -- the real shared-prefix signal;
+    2. a router-local proxy over what the request plane already carries:
+       working set x turns taken x live sub-agents.
+
+The fallback is not a placeholder for the first: an engine dump is only
+available from an sglang worker with the unified radix tree enabled, so the
+proxy is the operating point for every other backend. Both feed the same
+comparison, so a missing dump degrades the ordering's precision, never its
+correctness -- it can be no worse than the pause-smallest baseline it replaces.
 """
 
 from __future__ import annotations
@@ -15,8 +42,9 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from dynamo.aginfer_router.engine_state import EngineStateClient
 from dynamo.aginfer_router.program_state import (
     Program,
     ProgramLifecycle,
@@ -69,6 +97,49 @@ class ThunderAgentConfig:
     acting_decay_tau_seconds: float = 1.0
     buffer_per_program: int = 100
 
+    #: Weight on the live-sub-agent holder count in the proxy value. 0 drops
+    #: the holder term entirely (ablation: value = working set x turns).
+    holder_weight: float = 1.0
+    #: ``/aginfer/state`` URL. Unset => proxy value only.
+    state_url: Optional[str] = None
+    #: Order resumes by value too (most valuable admitted first) instead of
+    #: the default smallest-first. Off by default because it costs makespan:
+    #: see ``_resume_selection_key``. Kept as an opt-in so the cost stays
+    #: measurable.
+    value_ordered_resume: bool = False
+    #: How much a victim's size counts against picking it, relative to its
+    #: value. 0 is pure value; large approaches the size-ordered baseline.
+    #: See ``_pause_victim_key`` for why pure value strands its own victims.
+    victim_size_weight: float = 0.0
+
+
+def _normalised_ranks(
+    programs: list[Program], score: Callable[[Program], float]
+) -> dict[str, float]:
+    """Map each program to its rank under ``score``, scaled to [0, 1].
+
+    Equal scores share a rank, so two identical programs cannot be separated by
+    whichever happened to be inserted first.
+    """
+    if not programs:
+        return {}
+    if len(programs) == 1:
+        return {programs[0].program_id: 0.0}
+
+    ordered = sorted(programs, key=score)
+    span = float(len(ordered) - 1)
+    ranks: dict[str, float] = {}
+    index = 0
+    while index < len(ordered):
+        stop = index + 1
+        while stop < len(ordered) and score(ordered[stop]) == score(ordered[index]):
+            stop += 1
+        shared = (index + stop - 1) / 2.0 / span
+        for program in ordered[index:stop]:
+            ranks[program.program_id] = shared
+        index = stop
+    return ranks
+
 
 class ThunderAgentScheduler:
     def __init__(
@@ -84,6 +155,24 @@ class ThunderAgentScheduler:
         self._stat_forced_resumes = 0
         self._terminated: OrderedDict[str, float] = OrderedDict()
 
+        self._engine_state = EngineStateClient(config.state_url)
+        self._http: Optional[Any] = None
+        # pid -> the program that spawned it, and the reverse index. Holder
+        # counts are read through the program table so a child that ended
+        # stops counting even before _forget_program runs for it.
+        self._parent: dict[str, str] = {}
+        self._children: dict[str, set[str]] = {}
+        # Per-program V_u from the last engine dump; None => no dump.
+        self._engine_scores: Optional[dict[str, float]] = None
+        self._engine_scores_logged: Optional[bool] = None
+        self._id_mismatch_warned = False
+        # Bumped whenever the engine scores are replaced, so the memoised
+        # victim ranks below expire with them and not only when the table
+        # changes shape.
+        self._scores_generation = 0
+        self._victim_keys: dict[str, float] = {}
+        self._victim_keys_signature: Optional[tuple[int, int, int, int]] = None
+
     def start(self) -> None:
         if self._scheduler_task is not None:
             return
@@ -93,6 +182,18 @@ class ThunderAgentScheduler:
             self._cfg.scheduler_interval_seconds,
             self._cfg.pause_threshold,
             self._cfg.soft_demote_threshold,
+        )
+        if self._engine_state.enabled and self._http is None:
+            import httpx
+
+            self._http = httpx.AsyncClient()
+        logger.info(
+            "aginfer value gate active (holder_weight=%.2f, victim_size_weight=%.2f, "
+            "value_ordered_resume=%s, engine_state=%s)",
+            self._cfg.holder_weight,
+            self._cfg.victim_size_weight,
+            self._cfg.value_ordered_resume,
+            self._cfg.state_url or "off (proxy value)",
         )
 
     async def stop(self) -> None:
@@ -104,14 +205,19 @@ class ThunderAgentScheduler:
         except asyncio.CancelledError:
             pass
         self._scheduler_task = None
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     async def before_request(
         self,
         program_id: str,
         estimated_prompt_tokens: int = 0,
+        parent_program_id: Optional[str] = None,
     ) -> PauseDecision:
         wait_started = time.monotonic()
         async with self._lock:
+            self._observe_program(program_id, parent_program_id)
             wait_event, was_paused = self._admit_locked(
                 program_id, estimated_prompt_tokens
             )
@@ -372,6 +478,7 @@ class ThunderAgentScheduler:
             return
 
     async def _scheduler_tick(self) -> None:
+        await self._refresh_engine_scores()
         capacities = self._capacity.snapshot()
         if not capacities:
             return
@@ -394,26 +501,81 @@ class ThunderAgentScheduler:
         )
         return int(program.token_total * (2.0 ** (-(idle / tau))))
 
-    def _program_value(self, program: Program) -> float:
-        """aginfer V_u proxy for a program's KV — the value key that REPLACES
-        ThunderAgent's size-only ``token_total``.  Higher value = keep resident /
-        resume first; lower = pause / demote first.
+    # ---- program structure: the holder signal -------------------------------
 
-        v0 = token_total * reuse_weight * n_holders, where:
-          * token_total   — KV bytes at stake (the re-prefill cost if dropped),
-          * reuse_weight  — grows with the program's turn count: an established
-            multi-turn agent has reused its prefix repeatedly, so its KV is worth
-            more than a fresh/short program's of equal size (the program-aware
-            signal ThunderAgent lacks — it pauses purely by size),
-          * n_holders     — shared-prefix holder count (a prefix shared by N
-            trajectories is worth N x keeping; default 1, refined from the
-            KV-event stream in v1).
-        TODO v1: fold in ETA reuse-imminence (parked-in-tool-gap = will-resume =
-        high value) and KV-event-derived holder_count for the full DESIGN-§7 V_u."""
+    def _observe_program(
+        self, program_id: str, parent_program_id: Optional[str]
+    ) -> None:
+        """Record ``parent_session_id`` as a holder edge.
+
+        A program with live sub-agents is worth more than its own bytes: it is
+        blocked on them, so it WILL be re-entered when they return, and they
+        were forked from its context, so its prefix is shared rather than
+        private. Pause-smallest-first cannot see either -- the parent is often
+        the larger program, so size-ordered restore puts it last.
+
+        Called under ``self._lock`` on every request, before admission.
+        """
+        if not parent_program_id or parent_program_id == program_id:
+            return
+        if self._parent.get(program_id) == parent_program_id:
+            return
+        self._parent[program_id] = parent_program_id
+        self._children.setdefault(parent_program_id, set()).add(program_id)
+
+    def _forget_program(self, program_id: str) -> None:
+        """Drop whatever ``_observe_program`` recorded.
+
+        Called after the program leaves the table, so bookkeeping cannot
+        outlive the program it describes.
+        """
+        parent = self._parent.pop(program_id, None)
+        if parent is not None:
+            siblings = self._children.get(parent)
+            if siblings is not None:
+                siblings.discard(program_id)
+                if not siblings:
+                    del self._children[parent]
+        self._children.pop(program_id, None)
+
+    def _n_holders(self, program_id: str) -> float:
+        children = self._children.get(program_id)
+        if not children:
+            return 1.0
+        live = sum(1 for child in children if child in self._table.programs)
+        return 1.0 + self._cfg.holder_weight * live
+
+    # ---- the value itself -----------------------------------------------
+
+    def _program_value(self, program: Program) -> float:
+        """``V_u`` for a program's resident KV. Higher = keep / resume first.
+
+        Prefers the engine's own value state (``shared_aware_prog_scores``,
+        the real shared-prefix signal); falls back to a router-local proxy
+        when no engine dump is available (e.g. non-sglang backends, or the
+        unified radix tree is off).
+        """
+        if self._engine_scores is not None:
+            score = self._engine_scores.get(program.program_id)
+            if score is not None:
+                return float(score)
+        return self._proxy_value(program)
+
+    def _proxy_value(self, program: Program) -> float:
+        """Value from what the request plane alone carries.
+
+        ``working set x turns taken x holders``:
+
+        * working set -- the re-prefill cost if this KV is dropped;
+        * turns taken -- a program on its tenth turn has already re-read its
+          prefix nine times, so the same bytes have earned more than a fresh
+          program's;
+        * holders -- live sub-agents forked from this context (see
+          ``_observe_program``).
+        """
         tokens = float(max(0, program.token_total))
-        reuse_weight = 1.0 + float(max(0, getattr(program, "step_count", 0)))
-        n_holders = float(max(1, int(getattr(program, "n_holders", 1) or 1)))
-        return tokens * reuse_weight * n_holders
+        turns = 1.0 + float(max(0, program.step_count))
+        return tokens * turns * self._n_holders(program.program_id)
 
     def _active_programs_for_worker(self, worker_id: int) -> list[Program]:
         return [
@@ -519,6 +681,145 @@ class ThunderAgentScheduler:
                     final_used / capacity,
                 )
 
+    # ---- the overridden ordering keys ---------------------------------------
+
+    def _pause_victim_key(self, program: Program) -> float:
+        """Least valuable first, optionally discounted by how big the victim is.
+
+        Pure value (``victim_size_weight = 0``) loses to the size-ordered
+        baseline, and measurably so: it pauses 4x as often, each pause lasts
+        3.8x longer and 42 of 100 resumes come from the forced-resume timer
+        rather than from freed capacity (``benchmark/dynamo/README.md``). The
+        reason is that the engine scores a large low-reuse working set very
+        negative, so pure value systematically picks the *largest* programs,
+        and a large victim does not fit back under the resume ceiling. It
+        strands until the timer releases it, is still the least valuable, and
+        is paused again.
+
+        ``V(u) = p_reuse x reload_cost - holding_cost`` answers "what is worth
+        least" and says nothing about "can this be taken back", so this weight
+        supplies the missing half. Value and size are blended as normalised
+        ranks rather than raw numbers because they share no unit -- engine
+        scores land in the tens while the proxy lands in the millions, and any
+        fixed coefficient between them would be meaningless in one regime or
+        the other.
+
+        Ranks also make the two arms endpoints of one knob: 0 is the value
+        gate, and a large enough weight reproduces the baseline's
+        pause-smallest.
+
+        Avoid ``w = 1`` exactly. Equal weight on the two ranks means a program
+        that is last by value and first by size scores the same as its mirror
+        image, and on this workload that cancellation is the common case
+        rather than a corner: the engine scores large working sets most
+        negative, so value is anti-correlated with size by construction.
+        Sweep either side of 1.
+        """
+        if self._cfg.victim_size_weight <= 0.0:
+            return self._program_value(program)
+        blended = self._blended_victim_keys().get(program.program_id)
+        # A program not yet in the table (or a single-program table) has no
+        # rank to speak of; value alone still orders it consistently.
+        return self._program_value(program) if blended is None else blended
+
+    def _blended_victim_keys(self) -> dict[str, float]:
+        """Per-program ``value_rank + w * size_rank``, recomputed when stale.
+
+        Memoised because the key is asked for pairwise -- once per candidate
+        per comparison -- and a rank needs the whole table, which would
+        otherwise be re-sorted on every request.
+        """
+        signature = (
+            len(self._table.programs),
+            sum(p.token_total for p in self._table.programs.values()),
+            sum(p.step_count for p in self._table.programs.values()),
+            self._scores_generation,
+        )
+        if signature != self._victim_keys_signature:
+            programs = list(self._table.programs.values())
+            value_rank = _normalised_ranks(programs, self._program_value)
+            size_rank = _normalised_ranks(programs, lambda p: float(p.token_total))
+            weight = self._cfg.victim_size_weight
+            self._victim_keys = {
+                pid: value_rank[pid] + weight * size_rank[pid] for pid in value_rank
+            }
+            self._victim_keys_signature = signature
+        return self._victim_keys
+
+    def _resume_selection_key(self, program: Program) -> float:
+        """Size order (smallest first) unless ``value_ordered_resume``.
+
+        Pause and resume are not the same decision, so they do not take the
+        same key. Pause is a sacrifice: give up the KV worth least. Resume is
+        a queue: the ceiling admits a fixed number of tokens per tick, so
+        smallest-first lets the most programs back per tick and drains the
+        backlog fastest.
+
+        Ordering resumes by value inverts that -- the most valuable program is
+        usually also the largest (working set is a factor of the value), so
+        each tick readmits fewer programs, the backlog stops moving, and the
+        forced-resume timeout becomes the main way out. Measured on the
+        600-request Claude Code slice under manufactured pressure,
+        value-ordered resume ran 56.7 tok/s against the baseline's 144.7 with
+        11 of 21 resumes fired by the timer rather than by capacity; see
+        ``benchmark/dynamo/README.md``.
+        """
+        if self._cfg.value_ordered_resume:
+            # Ascending sort, so negate: most valuable is admitted first.
+            return -self._program_value(program)
+        return float(program.token_total)
+
+    # ---- engine state refresh (tick-cached, never per-request) --------------
+
+    async def _refresh_engine_scores(self) -> None:
+        """Pull the engine's value state once per tick.
+
+        The dump costs 5-50ms under load, so it stays on the background tick
+        and never touches request ingress. Any failure leaves
+        ``_engine_scores`` as None and the proxy takes over on the next
+        comparison.
+        """
+        if self._http is None or not self._engine_state.enabled:
+            return
+        state = await self._engine_state.fetch(self._http)
+        scores = self._engine_state.program_scores(state)
+        available = scores is not None
+        if available != self._engine_scores_logged:
+            self._engine_scores_logged = available
+            logger.info(
+                "aginfer value source: %s",
+                "engine state (%d programs scored)" % len(scores)
+                if scores is not None
+                else "proxy (engine state unavailable)",
+            )
+        self._engine_scores = scores
+        self._scores_generation += 1
+        self._warn_if_id_spaces_disjoint(scores)
+
+    def _warn_if_id_spaces_disjoint(self, scores: Optional[dict[str, float]]) -> None:
+        """A dump full of scores that match no program is an ID-space mismatch.
+
+        The engine keys value by ITS program id; the router keys by the
+        ``session_id`` on the wire. If those diverge -- salting, sanitising, a
+        different namespace -- every lookup misses and the per-program
+        fallback quietly serves the proxy for the whole fleet: the value path
+        would look enabled while never being used.
+        """
+        if self._id_mismatch_warned or not scores or not self._table.programs:
+            return
+        if any(pid in scores for pid in self._table.programs):
+            return
+        self._id_mismatch_warned = True
+        logger.warning(
+            "aginfer engine state scores %d programs but none match the "
+            "router's session ids (e.g. engine=%r router=%r); the value gate "
+            "is running on the proxy. Check that the worker keys programs by "
+            "the request's session_id.",
+            len(scores),
+            next(iter(scores)),
+            next(iter(self._table.programs)),
+        )
+
     def _smallest_candidates(
         self, worker_id: int
     ) -> tuple[Optional[Program], Optional[Program]]:
@@ -532,14 +833,14 @@ class ThunderAgentScheduler:
             if program.marked_for_pause:
                 continue
             if program.status == ProgramStatus.ACTING:
-                if smallest_acting is None or self._program_value(
+                if smallest_acting is None or self._pause_victim_key(
                     program
-                ) < self._program_value(smallest_acting):
+                ) < self._pause_victim_key(smallest_acting):
                     smallest_acting = program
             elif program.status == ProgramStatus.REASONING:
-                if smallest_reasoning is None or self._program_value(
+                if smallest_reasoning is None or self._pause_victim_key(
                     program
-                ) < self._program_value(smallest_reasoning):
+                ) < self._pause_victim_key(smallest_reasoning):
                     smallest_reasoning = program
         return smallest_acting, smallest_reasoning
 
@@ -563,7 +864,12 @@ class ThunderAgentScheduler:
         else:
             program.waiting.clear()
         self._table.paused[program_id] = None
-        logger.debug("Paused program %s (tokens=%d)", program_id, program.token_total)
+        logger.debug(
+            "Paused program %s (tokens=%d, key=%.6g)",
+            program_id,
+            program.token_total,
+            self._pause_victim_key(program),
+        )
         return True
 
     async def end_program(self, program_id: str) -> bool:
@@ -583,6 +889,7 @@ class ThunderAgentScheduler:
                 program.waiting.set()  # unblock any coroutine paused on this program
                 program.waiting = None
             self._table.release(program_id)
+            self._forget_program(program_id)
             logger.info(
                 "Released program %s (%d remaining)",
                 program_id,
@@ -631,9 +938,11 @@ class ThunderAgentScheduler:
                     return 0
                 return 2
 
-            # aginfer: within the structural group, resume HIGHEST-value first
-            # (ThunderAgent used token_total / size).
-            paused_programs.sort(key=lambda p: (group_key(p), -self._program_value(p)))
+            # Within the structural group, order by ``_resume_selection_key``
+            # (size ascending by default; value-descending opt-in).
+            paused_programs.sort(
+                key=lambda p: (group_key(p), self._resume_selection_key(p))
+            )
 
             resume_ceiling = max(
                 0.0, self._cfg.pause_threshold - self._cfg.resume_hysteresis
@@ -662,7 +971,7 @@ class ThunderAgentScheduler:
             if not resumable_programs:
                 return
 
-            resumable_programs.sort(key=lambda p: -self._program_value(p))
+            resumable_programs.sort(key=self._resume_selection_key)
             min_required = (
                 min(p.token_total for p in resumable_programs)
                 + self._cfg.buffer_per_program
@@ -710,8 +1019,9 @@ class ThunderAgentScheduler:
         if notify is not None:
             notify.set()
         logger.debug(
-            "Resumed program %s -> worker=%s (tokens=%d)",
+            "Resumed program %s -> worker=%s (tokens=%d, key=%.6g)",
             program.program_id,
             target_worker_id,
             program.token_total,
+            self._resume_selection_key(program),
         )

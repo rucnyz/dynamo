@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ThunderAgent router CLI parsing and config assembly."""
+"""ThunderAgent router CLI parsing and config assembly, plus the value gate's
+own knobs (per-program value, not working-set size, as the pause/resume gate).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ from typing import Optional
 
 from dynamo.aginfer_router.router import ThunderAgentConfig
 from dynamo.common.configuration.arg_group import ArgGroup
-from dynamo.common.configuration.utils import add_argument
+from dynamo.common.configuration.utils import add_argument, add_negatable_bool_argument
 from dynamo.router.args import (
     DynamoRouterArgGroup,
     DynamoRouterConfig,
@@ -37,6 +39,12 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
     tool_call_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
 
+    #: aginfer value gate knobs -- see ``ThunderAgentConfig`` for semantics.
+    aginfer_state_url: Optional[str] = None
+    aginfer_holder_weight: float = 1.0
+    aginfer_value_ordered_resume: bool = False
+    aginfer_victim_size_weight: float = 0.0
+
     def to_thunderagent_config(self) -> ThunderAgentConfig:
         return ThunderAgentConfig(
             pause_threshold=self.pause_threshold,
@@ -49,6 +57,10 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             acting_token_weight=self.acting_token_weight,
             acting_decay_tau_seconds=self.acting_decay_tau_seconds,
             scheduler_interval_seconds=self.scheduler_interval_seconds,
+            holder_weight=self.aginfer_holder_weight,
+            state_url=self.aginfer_state_url,
+            value_ordered_resume=self.aginfer_value_ordered_resume,
+            victim_size_weight=self.aginfer_victim_size_weight,
         )
 
     def validate(self) -> None:  # type: ignore[override]
@@ -69,6 +81,10 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             raise ValueError("--scheduler-interval-seconds must be > 0")
         if self.resume_timeout_seconds <= 0:
             raise ValueError("--resume-timeout-seconds must be > 0")
+        if self.aginfer_holder_weight < 0:
+            raise ValueError("--aginfer-holder-weight must be >= 0")
+        if self.aginfer_victim_size_weight < 0:
+            raise ValueError("--aginfer-victim-size-weight must be >= 0")
 
 
 class ThunderAgentArgGroup(ArgGroup):
@@ -219,11 +235,64 @@ class ThunderAgentArgGroup(ArgGroup):
             arg_type=str,
         )
 
+        vg = parser.add_argument_group("aginfer Value Gate Options")
+
+        add_argument(
+            vg,
+            flag_name="--aginfer-state-url",
+            env_var="DYN_AGINFER_STATE_URL",
+            default=None,
+            help="URL of the engine's ``/aginfer/state`` dump (e.g. "
+            "http://127.0.0.1:30000/aginfer/state). When set, per-program "
+            "value is read from the engine's own holder-split scores, "
+            "refreshed once per scheduler tick. Requires an sglang worker "
+            "with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1; unset or unreachable "
+            "falls back to the router-local proxy value.",
+            arg_type=str,
+        )
+        add_argument(
+            vg,
+            flag_name="--aginfer-holder-weight",
+            env_var="DYN_AGINFER_HOLDER_WEIGHT",
+            default=1.0,
+            help="Weight on live sub-agents in the proxy value: holders = "
+            "1 + w * live_children. 0 removes the holder term, leaving "
+            "working-set x turns (ablation) (default: 1.0).",
+            arg_type=float,
+        )
+        add_argument(
+            vg,
+            flag_name="--aginfer-victim-size-weight",
+            env_var="DYN_AGINFER_VICTIM_SIZE_WEIGHT",
+            default=0.0,
+            help="How much a pause victim's size counts against picking it, "
+            "relative to its value: the key is value_rank + w * size_rank over "
+            "the live programs. 0 is pure value, which strands its own victims "
+            "because the engine scores large working sets most negative and a "
+            "large victim does not fit back under the resume ceiling; a large w "
+            "approaches the size-ordered baseline (default: 0.0).",
+            arg_type=float,
+        )
+        add_negatable_bool_argument(
+            vg,
+            flag_name="--aginfer-value-ordered-resume",
+            env_var="DYN_AGINFER_VALUE_ORDERED_RESUME",
+            default=False,
+            help="Order resumes by value (most valuable admitted first) instead "
+            "of the default smallest-first. Off by default: the most "
+            "valuable program is usually the largest, so each resume tick "
+            "readmits fewer programs and the backlog stops draining. Kept as "
+            "an opt-in to keep that cost measurable, not because it is a "
+            "reasonable operating point.",
+            dest="aginfer_value_ordered_resume",
+        )
+
 
 def parse_args(argv: Optional[list[str]] = None) -> ThunderAgentRouterConfig:
     parser = argparse.ArgumentParser(
         description="Dynamo ThunderAgent Router: program-level scheduler with "
-        "tool-boundary pause/resume on top of native KV-aware routing",
+        "tool-boundary pause/resume on top of native KV-aware routing, with "
+        "per-program value (not working-set size) as the pause/resume gate",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     ThunderAgentArgGroup().add_arguments(parser)

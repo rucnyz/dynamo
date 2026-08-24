@@ -64,6 +64,7 @@ class ThunderAgentScheduler:
         self._lock = asyncio.Lock()
         self._scheduler_task: Optional[asyncio.Task] = None
         self._stat_forced_resumes = 0
+        self._last_logged_util = -1.0
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -90,9 +91,11 @@ class ThunderAgentScheduler:
         self,
         program_id: str,
         estimated_prompt_tokens: int = 0,
+        parent_program_id: Optional[str] = None,
     ) -> PauseDecision:
         wait_started = time.monotonic()
         async with self._lock:
+            self._observe_program(program_id, parent_program_id)
             wait_event, was_paused = self._admit_locked(
                 program_id, estimated_prompt_tokens
             )
@@ -239,11 +242,87 @@ class ThunderAgentScheduler:
         capacities = self._capacity.snapshot()
         if not capacities:
             return
+        self._log_utilization(capacities)
         # Upstream TA ordering: resume first, then pause -- a program paused
         # this tick can't resume until the next.
         self._apply_soft_demotes(capacities)
         await self._greedy_resume(capacities)
         await self._pause_until_safe(capacities)
+
+    def _log_utilization(self, capacities: dict[int, int]) -> None:
+        """Report headroom whenever it moves materially.
+
+        Nothing else reports it: a run with no pauses looks identical to a run
+        where the scheduler never came near ``pause_threshold``, and the second
+        is the common case. Any comparison against this scheduler is vacuous
+        until this line shows util reaching the threshold, so make the distance
+        to it observable rather than inferred from an absence of pause logs.
+        """
+        busiest = max(
+            capacities,
+            key=lambda w: self._worker_used(w) / max(1, capacities[w]),
+        )
+        capacity = max(1, capacities[busiest])
+        used = self._worker_used(busiest)
+        util = used / capacity
+        if abs(util - self._last_logged_util) < 0.05:
+            return
+        self._last_logged_util = util
+        logger.info(
+            "scheduler.util worker=%s used=%d/%d util=%.2f programs=%d "
+            "paused=%d (pause at %.2f)",
+            busiest,
+            used,
+            capacity,
+            util,
+            len(self._active_programs_for_worker(busiest)),
+            len(self._table.paused),
+            self._cfg.pause_threshold,
+        )
+
+    def _observe_program(
+        self, program_id: str, parent_program_id: Optional[str]
+    ) -> None:
+        """Record structure carried by the request but not used for capacity.
+
+        A no-op here: this scheduler admits on working-set size alone, so the
+        sub-agent parent link is irrelevant to it. ``aginfer_router`` runs its
+        own independent scheduler (not a subclass of this one) that builds a
+        holder graph from the same ``parent_program_id`` for its value gate;
+        this hook just accepts the same call shape so both routers'
+        ``before_request`` are interchangeable from the caller's side. Called
+        under ``self._lock`` on every request, before admission.
+        """
+
+    def _forget_program(self, program_id: str) -> None:
+        """Drop whatever ``_observe_program`` recorded. No-op in the baseline.
+
+        Called under ``self._lock`` after the program leaves the table, so
+        bookkeeping (were this not a no-op) could not outlive the program it
+        describes.
+        """
+
+    def _pause_victim_key(self, program: Program) -> float:
+        """Ordering key for picking a pause victim -- LOWEST key is paused first.
+
+        Always the working set itself here, i.e. pause-smallest-ACTING-first.
+        ``aginfer_router`` scores this key by per-program value instead of
+        size in its own independent implementation of this class -- that pair
+        (this and ``_resume_selection_key``) is the entire behavioral
+        difference between the two routers, so the surrounding machinery
+        (watermarks, soft-demote, BFD placement, forced-resume) stays
+        key-agnostic and identical in both.
+        """
+        return float(program.token_total)
+
+    def _resume_selection_key(self, program: Program) -> float:
+        """Ordering key for WHICH paused programs get resumed -- ascending.
+
+        Baseline is size (smallest-first admission). Note this is selection
+        only: the placement pass that follows stays size-descending because it
+        is a bin-packing heuristic, not a policy.
+        """
+        return float(program.token_total)
 
     def _program_tokens(self, program: Program, *, decayed: bool = False) -> int:
         if program.status != ProgramStatus.ACTING:
@@ -375,16 +454,14 @@ class ThunderAgentScheduler:
             if program.marked_for_pause:
                 continue
             if program.status == ProgramStatus.ACTING:
-                if (
-                    smallest_acting is None
-                    or program.token_total < smallest_acting.token_total
-                ):
+                if smallest_acting is None or self._pause_victim_key(
+                    program
+                ) < self._pause_victim_key(smallest_acting):
                     smallest_acting = program
             elif program.status == ProgramStatus.REASONING:
-                if (
-                    smallest_reasoning is None
-                    or program.token_total < smallest_reasoning.token_total
-                ):
+                if smallest_reasoning is None or self._pause_victim_key(
+                    program
+                ) < self._pause_victim_key(smallest_reasoning):
                     smallest_reasoning = program
         return smallest_acting, smallest_reasoning
 
@@ -408,7 +485,15 @@ class ThunderAgentScheduler:
         else:
             program.waiting.clear()
         self._table.paused[program_id] = None
-        logger.debug("Paused program %s (tokens=%d)", program_id, program.token_total)
+        # INFO, with the key that selected it: comparing two schedulers means
+        # comparing the victims they pick, and a count of pauses cannot show
+        # that they picked differently.
+        logger.info(
+            "scheduler.pause program=%s tokens=%d key=%.6g",
+            program_id,
+            program.token_total,
+            self._pause_victim_key(program),
+        )
         return True
 
     async def end_program(self, program_id: str) -> bool:
@@ -427,6 +512,7 @@ class ThunderAgentScheduler:
                 program.waiting.set()  # unblock any coroutine paused on this program
                 program.waiting = None
             self._table.release(program_id)
+            self._forget_program(program_id)
             logger.info(
                 "Released program %s (%d remaining)",
                 program_id,
@@ -454,7 +540,9 @@ class ThunderAgentScheduler:
                     return 0
                 return 2
 
-            paused_programs.sort(key=lambda p: (group_key(p), p.token_total))
+            paused_programs.sort(
+                key=lambda p: (group_key(p), self._resume_selection_key(p))
+            )
 
             resume_ceiling = max(
                 0.0, self._cfg.pause_threshold - self._cfg.resume_hysteresis
@@ -528,9 +616,10 @@ class ThunderAgentScheduler:
         self._table.paused.pop(program.program_id, None)
         if notify is not None:
             notify.set()
-        logger.debug(
-            "Resumed program %s -> worker=%s (tokens=%d)",
+        logger.info(
+            "scheduler.resume program=%s worker=%s tokens=%d key=%.6g",
             program.program_id,
             target_worker_id,
             program.token_total,
+            self._resume_selection_key(program),
         )

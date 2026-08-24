@@ -59,6 +59,24 @@ def _is_session_final(request: dict[str, Any]) -> bool:
     return isinstance(ctx, dict) and bool(ctx.get("session_final"))
 
 
+def _extract_parent_program_id(request: dict[str, Any]) -> Optional[str]:
+    """``parent_session_id`` -- the session that spawned this one as a sub-agent.
+
+    Unused by this router (it schedules on working-set size alone; see
+    ``ThunderAgentScheduler._observe_program``). Extracted and passed through
+    anyway so ``before_request`` has the same call shape as
+    ``aginfer_router``'s independent scheduler, which builds a holder graph
+    from this same field for its value gate.
+    """
+    ctx = request.get("agent_context")
+    if not isinstance(ctx, dict):
+        return None
+    pid = ctx.get("parent_session_id")
+    if isinstance(pid, str) and pid:
+        return pid
+    return None
+
+
 def _wrap_preprocessed_request(request: dict[str, Any]) -> dict[str, Any]:
     # Duplicated from dynamo.router/__main__.py since neither package exports
     # it. TODO(idhanani): file follow-up to lift this into dynamo.router as a
@@ -88,6 +106,15 @@ def _wrap_preprocessed_request(request: dict[str, Any]) -> dict[str, Any]:
 
 
 class ThunderAgentRouterHandler:
+    #: Endpoint suffix and metrics label: this router serves
+    #: ``{namespace}.{SERVICE_NAME}.generate``. A subclass overriding the
+    #: scheduling policy would set its own so the two could run side by side
+    #: in one namespace for an A/B -- ``aginfer_router`` instead ships a
+    #: fully independent handler/worker (see its own ``__main__.py``), so
+    #: nothing currently subclasses this one; the extension point stays in
+    #: case a future peer wants to reuse this request-handling path as-is.
+    SERVICE_NAME = "thunderagent_router"
+
     def __init__(
         self,
         runtime: DistributedRuntime,
@@ -115,11 +142,20 @@ class ThunderAgentRouterHandler:
         self._capacity = WorkerCapacityProvider(worker_endpoint)
         self._capacity.start()
 
-        self._scheduler = ThunderAgentScheduler(
-            capacity=self._capacity,
+        self._scheduler = self._build_scheduler(self._capacity)
+        self._scheduler.start()
+
+    def _build_scheduler(
+        self, capacity: WorkerCapacityProvider
+    ) -> ThunderAgentScheduler:
+        """The scheduling policy -- the one thing a subclass would override.
+
+        No subclass exists today; see the ``SERVICE_NAME`` note above.
+        """
+        return ThunderAgentScheduler(
+            capacity=capacity,
             config=self._config.to_thunderagent_config(),
         )
-        self._scheduler.start()
 
     async def shutdown(self) -> None:
         if self._scheduler is not None:
@@ -156,6 +192,7 @@ class ThunderAgentRouterHandler:
         decision = await self._scheduler.before_request(
             program_id,
             estimated_prompt_tokens=estimated_prompt_tokens,
+            parent_program_id=_extract_parent_program_id(request),
         )
         worker_pin = decision.assigned_worker_hint
 
@@ -256,21 +293,32 @@ class ThunderAgentRouterHandler:
         )
 
 
-@dynamo_worker()
-async def worker(runtime: DistributedRuntime) -> None:
-    config = parse_args()
+async def run_router(
+    runtime: DistributedRuntime,
+    config: ThunderAgentRouterConfig,
+    handler_class: type[ThunderAgentRouterHandler],
+) -> None:
+    """Serve ``handler_class`` under its ``SERVICE_NAME``.
+
+    Only ``thunderagent_router`` calls this today -- ``aginfer_router`` ships
+    its own independent ``worker()`` (not a subclass of ``handler_class``
+    here), after a copy-based split repeatedly left the peer reading a
+    request field upstream had already changed here. This function stays
+    factored out as the place a future subclassing peer would hook in
+    without duplicating endpoint/registration/shutdown wiring again.
+    """
+    service = handler_class.SERVICE_NAME
     logger.info(
-        "ThunderAgent Router starting (endpoint=%s, namespace=%s)",
+        "%s starting (endpoint=%s, namespace=%s)",
+        service,
         config.endpoint,
         config.namespace,
     )
 
-    handler = ThunderAgentRouterHandler(runtime, config)
+    handler = handler_class(runtime, config)
     await handler.initialize()
 
-    generate_endpoint = runtime.endpoint(
-        f"{config.namespace}.thunderagent_router.generate"
-    )
+    generate_endpoint = runtime.endpoint(f"{config.namespace}.{service}.generate")
 
     if config.model_name:
         model_path = config.model_path or config.model_name
@@ -302,10 +350,15 @@ async def worker(runtime: DistributedRuntime) -> None:
         await generate_endpoint.serve_endpoint(
             handler.generate,
             graceful_shutdown=True,
-            metrics_labels=[("service", "thunderagent_router")],
+            metrics_labels=[("service", service)],
         )
     finally:
         await handler.shutdown()
+
+
+@dynamo_worker()
+async def worker(runtime: DistributedRuntime) -> None:
+    await run_router(runtime, parse_args(), ThunderAgentRouterHandler)
 
 
 def main() -> None:

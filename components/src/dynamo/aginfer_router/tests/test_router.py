@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for ThunderAgentScheduler that don't need a Dynamo runtime."""
+"""Unit tests for ThunderAgentScheduler that don't need a Dynamo runtime.
+
+The pause/resume/BFD/SESSION_END machinery is covered in the first half. The
+second half (below ``# ---- value gate`` ) pins the value-gate delta on top of
+it -- that value, not size, decides who gets paused and (opt-in) who gets
+resumed first -- so each of those tests is built so the size-ordered baseline
+would make the OPPOSITE choice.
+"""
 
 from __future__ import annotations
 
@@ -430,3 +437,375 @@ async def test_scheduler_tick_resumes_before_pausing_new_overload():
         if p.lifecycle == ProgramLifecycle.PAUSED
     )
     assert paused == 6
+
+
+# ---- value gate: pause picks least valuable, not smallest -----------------
+
+
+async def add_program(
+    router: ThunderAgentScheduler,
+    pid: str,
+    *,
+    tokens: int,
+    worker_id: Optional[int] = None,
+    turns: int = 1,
+    parent: Optional[str] = None,
+) -> None:
+    """Drive a program to ACTING with ``turns`` completed requests.
+
+    Programs are built against an EMPTY capacity snapshot (the provider is
+    populated, or the snapshot passed in, only once the table is set up):
+    admission would otherwise queue the later ones on a worker the earlier ones
+    have already filled, and ``before_request`` would block on the resume
+    timeout instead of returning.
+    """
+    for _ in range(turns):
+        await router.before_request(pid, parent_program_id=parent)
+        if worker_id is not None:
+            await router.assign_worker(pid, worker_id)
+        await router.after_request(pid, prompt_tokens=tokens, completion_tokens=0)
+
+
+def _pause_cfg(**kw) -> ThunderAgentConfig:
+    return ThunderAgentConfig(
+        pause_threshold=0.80,
+        pause_target=0.80,
+        acting_token_weight=1.0,
+        scheduler_interval_seconds=10.0,
+        **kw,
+    )
+
+
+@pytest.mark.asyncio
+async def test_value_gate_picks_least_valuable_not_smallest():
+    """``small`` is a third of ``big`` but has ten turns behind it, so its
+    bytes have been re-read nine more times: pause-smallest would evict it
+    precisely because it is small; the value gate evicts ``big`` instead."""
+    workers = {1: 1000}
+
+    router, _ = make_router(config=_pause_cfg())
+    await add_program(router, "big", tokens=600, worker_id=1, turns=1)
+    await add_program(router, "small", tokens=300, worker_id=1, turns=10)
+    await router._pause_until_safe(workers)
+    assert router._table.programs["big"].lifecycle == ProgramLifecycle.PAUSED
+    assert router._table.programs["small"].lifecycle == ProgramLifecycle.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_pause_spares_the_parent_of_live_sub_agents():
+    """A blocked parent is the worst thing to pause: it will be re-entered the
+    moment its children return, and they were forked from its context."""
+    workers = {1: 1000}
+    router, _ = make_router(config=_pause_cfg())
+
+    await add_program(router, "big", tokens=600, worker_id=1, turns=1)
+    await add_program(router, "parent", tokens=300, worker_id=1, turns=1)
+    for i in range(4):
+        await add_program(router, f"child{i}", tokens=10, parent="parent")
+
+    await router._pause_until_safe(workers)
+
+    assert router._table.programs["big"].lifecycle == ProgramLifecycle.PAUSED
+    assert router._table.programs["parent"].lifecycle == ProgramLifecycle.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_holder_weight_zero_reverts_to_size_times_turns():
+    """Ablation knob: with the holder term off, the same fan-out no longer
+    protects the parent, so the choice falls back to the smaller program."""
+    workers = {1: 1000}
+    router, _ = make_router(config=_pause_cfg(holder_weight=0.0))
+
+    await add_program(router, "big", tokens=600, worker_id=1, turns=1)
+    await add_program(router, "parent", tokens=300, worker_id=1, turns=1)
+    for i in range(4):
+        await add_program(router, f"child{i}", tokens=10, parent="parent")
+
+    await router._pause_until_safe(workers)
+
+    assert router._table.programs["parent"].lifecycle == ProgramLifecycle.PAUSED
+    assert router._table.programs["big"].lifecycle == ProgramLifecycle.ACTIVE
+
+
+# ---- victim size weight: recoverability -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_size_weight_stops_value_from_picking_the_largest_victim():
+    """The pure-value gate pauses ``big`` and then cannot fit it back.
+
+    Value is deliberately inverted against size here, which is what the engine
+    actually reports: it scores a large low-reuse working set most negative. With
+    the size weight on, the victim ordering flips to the small program, which is
+    the one admission control can actually re-grant.
+    """
+    workers = {1: 1000}
+
+    pure, _ = make_router(config=_pause_cfg())
+    await add_program(pure, "big", tokens=600, worker_id=1, turns=1)
+    await add_program(pure, "small", tokens=300, worker_id=1, turns=10)
+    await pure._pause_until_safe(workers)
+    assert pure._table.programs["big"].lifecycle == ProgramLifecycle.PAUSED
+
+    weighted, _ = make_router(config=_pause_cfg(victim_size_weight=4.0))
+    await add_program(weighted, "big", tokens=600, worker_id=1, turns=1)
+    await add_program(weighted, "small", tokens=300, worker_id=1, turns=10)
+    await weighted._pause_until_safe(workers)
+    assert weighted._table.programs["small"].lifecycle == ProgramLifecycle.PAUSED
+    assert weighted._table.programs["big"].lifecycle == ProgramLifecycle.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_size_weight_zero_is_the_pure_value_key():
+    """The knob's low end has to be the policy that was measured, exactly."""
+    router, _ = make_router(config=_pause_cfg())
+    await add_program(router, "big", tokens=600, turns=1)
+    await add_program(router, "small", tokens=300, turns=10)
+
+    for pid in ("big", "small"):
+        program = router._table.programs[pid]
+        assert router._pause_victim_key(program) == router._program_value(program)
+
+
+@pytest.mark.asyncio
+async def test_equal_programs_share_a_rank():
+    """Otherwise insertion order silently becomes a tiebreaker in the key."""
+    router, _ = make_router(config=_pause_cfg(victim_size_weight=1.0))
+    await add_program(router, "first", tokens=300, turns=2)
+    await add_program(router, "second", tokens=300, turns=2)
+
+    keys = router._blended_victim_keys()
+    assert keys["first"] == keys["second"]
+
+
+@pytest.mark.asyncio
+async def test_ranks_expire_when_the_engine_scores_change():
+    """The ranks are memoised on the table's shape, which a new dump does not
+    change -- so a score refresh has to invalidate them on its own or the gate
+    keeps ordering by a stale dump."""
+    # Not 1.0: at w=1 value and size carry equal weight, so a pair whose value
+    # order is the exact reverse of its size order cancels to a tie (see
+    # test_weight_one_cancels_perfectly_anti_correlated_inputs).
+    router, _ = make_router(config=_pause_cfg(victim_size_weight=0.5))
+    await add_program(router, "a", tokens=600, turns=1)
+    await add_program(router, "b", tokens=300, turns=1)
+
+    router._engine_scores = {"a": 10.0, "b": -10.0}
+    router._scores_generation += 1
+    before = dict(router._blended_victim_keys())
+    assert before["a"] > before["b"]
+
+    router._engine_scores = {"a": -10.0, "b": 10.0}
+    router._scores_generation += 1
+    after = router._blended_victim_keys()
+    assert after["a"] < after["b"]
+
+
+@pytest.mark.asyncio
+async def test_weight_one_cancels_perfectly_anti_correlated_inputs():
+    """w=1 is a degenerate point, and on this workload it is the likely one.
+
+    Equal weight on both ranks means a program that is last by value and first by
+    size scores the same as its mirror image, so the key carries no information
+    and the ordering falls back to whatever the pairwise scan saw first. That is
+    not hypothetical here: the engine scores large working sets most negative, so
+    value is anti-correlated with size by construction. Pick a weight either side
+    of 1.
+    """
+    router, _ = make_router(config=_pause_cfg(victim_size_weight=1.0))
+    await add_program(router, "a", tokens=600, turns=1)
+    await add_program(router, "b", tokens=300, turns=1)
+    router._engine_scores = {"a": -10.0, "b": 10.0}
+    router._scores_generation += 1
+
+    keys = router._blended_victim_keys()
+    assert keys["a"] == keys["b"]
+
+
+# ---- resume: default smallest-first, value-ordered opt-in ------------------
+
+
+def _resume_cfg(**kw) -> ThunderAgentConfig:
+    return ThunderAgentConfig(
+        pause_threshold=1.0,
+        pause_target=0.80,
+        resume_hysteresis=0.0,
+        scheduler_interval_seconds=10.0,
+        **kw,
+    )
+
+
+async def _two_paused_programs(router: ThunderAgentScheduler) -> None:
+    """``cheap`` and ``rich`` are the same size; only ``rich`` has sub-agents.
+
+    Same structural group on purpose (same turn count, both ACTING): the
+    inherited group pre-sort outranks the ordering key, so the key only reorders
+    within a group. ``cheap`` is inserted first, which is what a stable size sort
+    picks between equals.
+    """
+    await add_program(router, "cheap", tokens=600, worker_id=1, turns=2)
+    await add_program(router, "rich", tokens=600, worker_id=1, turns=2)
+    for i in range(3):
+        await add_program(router, f"child{i}", tokens=10, parent="rich")
+    for pid in ("cheap", "rich"):
+        assert await router._pause_acting(pid)
+
+
+@pytest.mark.asyncio
+async def test_resume_is_not_value_ordered_by_default():
+    """Pause and resume are different decisions and must not share a key.
+
+    Resume is a queue: the ceiling admits a fixed token budget per tick, so
+    smallest-first readmits the most programs and drains the backlog fastest.
+    Value-ordering it readmits the largest (value scales with working set), the
+    backlog stalls, and the forced-resume timer becomes the way out -- measured
+    at 56.7 tok/s against the baseline's 144.7. So the default stays size-ordered
+    even though the pause victim is still value-chosen.
+    """
+    router, _ = make_router(config=_resume_cfg())
+    await _two_paused_programs(router)
+
+    for pid in ("cheap", "rich"):
+        program = router._table.programs[pid]
+        assert router._resume_selection_key(program) == float(program.token_total)
+    # The pause side is still ours: rich outscores cheap at identical size.
+    rich = router._table.programs["rich"]
+    cheap = router._table.programs["cheap"]
+    assert router._pause_victim_key(rich) > router._pause_victim_key(cheap)
+
+
+@pytest.mark.asyncio
+async def test_value_ordered_resume_admits_most_valuable_first():
+    """The opt-in ablation, kept so its cost stays measurable."""
+    router, _ = make_router(config=_resume_cfg(value_ordered_resume=True))
+    await _two_paused_programs(router)
+
+    # 1000 admits one program (600 + 100 buffer), never both.
+    await router._greedy_resume({1: 1000})
+
+    assert router._table.programs["rich"].lifecycle == ProgramLifecycle.ACTIVE
+    assert router._table.programs["cheap"].lifecycle == ProgramLifecycle.PAUSED
+
+
+# ---- holder bookkeeping -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_holders_count_only_live_children():
+    router, _ = make_router()
+    await add_program(router, "parent", tokens=100)
+    await add_program(router, "a", tokens=10, parent="parent")
+    await add_program(router, "b", tokens=10, parent="parent")
+    assert router._n_holders("parent") == 3.0
+
+    await router.end_program("a")
+    assert router._n_holders("parent") == 2.0
+
+    await router.end_program("b")
+    assert router._n_holders("parent") == 1.0
+    # The reverse index is dropped with the last child, not left to grow.
+    assert "parent" not in router._children
+
+
+@pytest.mark.asyncio
+async def test_repeated_turns_do_not_inflate_holder_count():
+    """Every turn of a sub-agent re-sends parent_session_id; the edge is a set."""
+    router, _ = make_router()
+    await add_program(router, "parent", tokens=100)
+    await add_program(router, "a", tokens=10, parent="parent", turns=5)
+    assert router._n_holders("parent") == 2.0
+
+
+@pytest.mark.asyncio
+async def test_self_parent_edge_ignored():
+    router, _ = make_router()
+    await add_program(router, "p", tokens=100, parent="p")
+    assert router._n_holders("p") == 1.0
+
+
+# ---- engine state as the value source ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_engine_scores_override_proxy_per_program():
+    router, _ = make_router()
+    await add_program(router, "a", tokens=100, turns=3)
+    await add_program(router, "b", tokens=100, turns=3)
+    proxy_b = router._program_value(router._table.programs["b"])
+
+    router._engine_scores = {"a": 42.0}
+
+    assert router._program_value(router._table.programs["a"]) == 42.0
+    # A program the dump does not mention keeps the proxy rather than 0.
+    assert router._program_value(router._table.programs["b"]) == proxy_b
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_noop_without_state_url():
+    """Do-no-harm: no URL means no client, no fetch, and the proxy stands."""
+    router, _ = make_router()
+    assert router._engine_state.enabled is False
+    router.start()
+    try:
+        assert router._http is None
+        await router._refresh_engine_scores()
+        assert router._engine_scores is None
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_refresh_picks_up_engine_scores_then_degrades():
+    router, _ = make_router(
+        config=ThunderAgentConfig(
+            scheduler_interval_seconds=10.0,
+            state_url="http://127.0.0.1:1/aginfer/state",
+        )
+    )
+    router._http = object()  # only truthiness matters; fetch is stubbed below
+
+    scores: Optional[dict] = {"a": 7.0}
+
+    async def fake_fetch(_client):
+        return "state" if scores is not None else None
+
+    router._engine_state.fetch = fake_fetch  # type: ignore[method-assign]
+    router._engine_state.program_scores = lambda _state: scores  # type: ignore[method-assign]
+
+    await router._refresh_engine_scores()
+    assert router._engine_scores == {"a": 7.0}
+
+    scores = None
+    await router._refresh_engine_scores()
+    assert router._engine_scores is None
+
+
+@pytest.mark.asyncio
+async def test_disjoint_id_spaces_are_reported_once(caplog):
+    """Scores that match no session id mean the value gate is silently on the
+    proxy for the whole fleet -- that must not be invisible."""
+    router, _ = make_router(
+        config=ThunderAgentConfig(
+            scheduler_interval_seconds=10.0,
+            state_url="http://127.0.0.1:1/aginfer/state",
+        )
+    )
+    router._http = object()
+    await add_program(router, "sess#salt", tokens=100)
+
+    async def fake_fetch(_client):
+        return "state"
+
+    router._engine_state.fetch = fake_fetch  # type: ignore[method-assign]
+    router._engine_state.program_scores = lambda _s: {"unsalted-pid": 1.0}  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        await router._refresh_engine_scores()
+        await router._refresh_engine_scores()
+
+    warnings = [r for r in caplog.records if "none match the" in r.getMessage()]
+    assert len(warnings) == 1, "expected exactly one mismatch warning, got %d" % len(
+        warnings
+    )
+    # Still serving values, just not the engine's.
+    assert router._program_value(router._table.programs["sess#salt"]) == 200.0
