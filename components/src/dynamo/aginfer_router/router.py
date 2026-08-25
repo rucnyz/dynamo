@@ -154,6 +154,7 @@ class ThunderAgentScheduler:
         self._scheduler_task: Optional[asyncio.Task] = None
         self._stat_forced_resumes = 0
         self._terminated: OrderedDict[str, float] = OrderedDict()
+        self._last_logged_util = -1.0
 
         self._engine_state = EngineStateClient(config.state_url)
         self._http: Optional[Any] = None
@@ -482,11 +483,42 @@ class ThunderAgentScheduler:
         capacities = self._capacity.snapshot()
         if not capacities:
             return
+        self._log_utilization(capacities)
         # Upstream TA ordering: resume first, then pause -- a program paused
         # this tick can't resume until the next.
         self._apply_soft_demotes(capacities)
         await self._greedy_resume(capacities)
         await self._pause_until_safe(capacities)
+
+    def _log_utilization(self, capacities: dict[int, int]) -> None:
+        """Report headroom whenever it moves materially.
+
+        Same contract as ``thunderagent_router``'s: ``run_ab_router.sh``'s
+        ``isolate_arm`` greps this exact literal to print what an arm actually
+        started from, and a run with no pauses is otherwise indistinguishable
+        from one that never came near ``pause_threshold``.
+        """
+        busiest = max(
+            capacities,
+            key=lambda w: self._worker_used(w) / max(1, capacities[w]),
+        )
+        capacity = max(1, capacities[busiest])
+        used = self._worker_used(busiest)
+        util = used / capacity
+        if abs(util - self._last_logged_util) < 0.05:
+            return
+        self._last_logged_util = util
+        logger.info(
+            "scheduler.util worker=%s used=%d/%d util=%.2f programs=%d "
+            "paused=%d (pause at %.2f)",
+            busiest,
+            used,
+            capacity,
+            util,
+            len(self._active_programs_for_worker(busiest)),
+            len(self._table.paused),
+            self._cfg.pause_threshold,
+        )
 
     def _program_tokens(self, program: Program, *, decayed: bool = False) -> int:
         if program.status != ProgramStatus.ACTING:
@@ -864,8 +896,13 @@ class ThunderAgentScheduler:
         else:
             program.waiting.clear()
         self._table.paused[program_id] = None
-        logger.debug(
-            "Paused program %s (tokens=%d, key=%.6g)",
+        # INFO, with the key that selected it: comparing two schedulers means
+        # comparing the victims they pick, and a count of pauses cannot show
+        # that they picked differently. run_ab_router.sh / analyze_ab.py grep
+        # this exact literal ("scheduler.pause") to attribute pause events to
+        # an arm, so keep it in parity with thunderagent_router's.
+        logger.info(
+            "scheduler.pause program=%s tokens=%d key=%.6g",
             program_id,
             program.token_total,
             self._pause_victim_key(program),
@@ -1018,8 +1055,9 @@ class ThunderAgentScheduler:
         self._table.paused.pop(program.program_id, None)
         if notify is not None:
             notify.set()
-        logger.debug(
-            "Resumed program %s -> worker=%s (tokens=%d, key=%.6g)",
+        # INFO, same literal contract as scheduler.pause above -- see there.
+        logger.info(
+            "scheduler.resume program=%s worker=%s tokens=%d key=%.6g",
             program.program_id,
             target_worker_id,
             program.token_total,
