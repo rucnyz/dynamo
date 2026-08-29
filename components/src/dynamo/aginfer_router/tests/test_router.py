@@ -622,6 +622,107 @@ async def test_weight_one_cancels_perfectly_anti_correlated_inputs():
     assert keys["a"] == keys["b"]
 
 
+# ---- recoverability weight: penalise against the ceiling, not the table ----
+
+
+@pytest.mark.asyncio
+async def test_recoverability_weight_ignores_victims_that_fit_regardless_of_size():
+    """Size-rank compares a victim against whoever else happens to be in the
+    table, so two programs that both comfortably fit under the resume ceiling
+    still get spread 0..1 apart purely because one is 3x the other. That
+    penalises a victim for nothing: it was never going to strand either way.
+    Recoverability compares against the ceiling itself, so both score zero --
+    and reserves the penalty for the one that actually cannot come back.
+    """
+    router, _ = make_router(config=_pause_cfg(victim_recoverability_weight=2.0))
+    await add_program(router, "a", tokens=100, turns=1)
+    await add_program(router, "b", tokens=300, turns=1)
+    await add_program(router, "huge", tokens=5000, turns=1)
+    # Equalise value so only the size/recoverability term can separate them.
+    router._engine_scores = {"a": 0.0, "b": 0.0, "huge": 0.0}
+    router._scores_generation += 1
+    # As a real tick would: capacity=1000, pause_target=0.80 -> ceiling=800.
+    router._pause_target_ceiling = 800.0
+
+    keys = router._blended_victim_keys()
+    assert keys["a"] == keys["b"]
+    assert keys["huge"] > keys["a"]
+
+    # The same table under the size-rank term alone WOULD separate a and b,
+    # which is the behaviour recoverability is meant to not have.
+    size_only, _ = make_router(config=_pause_cfg(victim_size_weight=2.0))
+    await add_program(size_only, "a", tokens=100, turns=1)
+    await add_program(size_only, "b", tokens=300, turns=1)
+    await add_program(size_only, "huge", tokens=5000, turns=1)
+    size_only._engine_scores = {"a": 0.0, "b": 0.0, "huge": 0.0}
+    size_only._scores_generation += 1
+    size_keys = size_only._blended_victim_keys()
+    assert size_keys["a"] != size_keys["b"]
+
+
+@pytest.mark.asyncio
+async def test_recoverability_weight_zero_is_unaffected():
+    """Default off: identical to the pure-value key, same as size_weight=0."""
+    router, _ = make_router(config=_pause_cfg())
+    await add_program(router, "a", tokens=100, turns=1)
+    await add_program(router, "huge", tokens=5000, turns=1)
+    router._pause_target_ceiling = 800.0
+
+    for pid in ("a", "huge"):
+        program = router._table.programs[pid]
+        assert router._pause_victim_key(program) == router._program_value(program)
+
+
+@pytest.mark.asyncio
+async def test_recoverability_weight_before_any_tick_is_a_no_op():
+    """No capacity snapshot has been seen yet -> the ceiling is unknown, so
+    the term must not fire on a made-up ceiling (e.g. zero, which would flag
+    everything as unrecoverable)."""
+    router, _ = make_router(config=_pause_cfg(victim_recoverability_weight=2.0))
+    await add_program(router, "a", tokens=100, turns=1)
+    await add_program(router, "huge", tokens=5000, turns=1)
+    assert router._pause_target_ceiling is None
+
+    huge = router._table.programs["huge"]
+    assert router._recoverability_penalty(huge) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_recoverability_and_size_weight_combine():
+    """The two terms are additive, not either/or: a victim can be penalised
+    for being merely the biggest program present (size) AND for exceeding the
+    ceiling outright (recoverability) at the same time."""
+    router, _ = make_router(
+        config=_pause_cfg(victim_size_weight=1.0, victim_recoverability_weight=1.0)
+    )
+    await add_program(router, "a", tokens=100, turns=1)
+    await add_program(router, "huge", tokens=5000, turns=1)
+    router._pause_target_ceiling = 800.0
+
+    keys = router._blended_victim_keys()
+    size_only, _ = make_router(config=_pause_cfg(victim_size_weight=1.0))
+    await add_program(size_only, "a", tokens=100, turns=1)
+    await add_program(size_only, "huge", tokens=5000, turns=1)
+    size_only_keys = size_only._blended_victim_keys()
+
+    # Adding the recoverability term on top can only push "huge" further
+    # away from "a" (both blends already agree "huge" is worse).
+    assert keys["huge"] - keys["a"] > size_only_keys["huge"] - size_only_keys["a"]
+
+
+@pytest.mark.asyncio
+async def test_pause_until_safe_populates_the_ceiling_from_live_capacity():
+    """``_pause_target_ceiling`` has to come from a real tick's capacity
+    snapshot (``_pause_until_safe`` is also how ``_scheduler_tick`` reaches
+    it), not just be settable by a test writing to the private field."""
+    router, _ = make_router(config=_pause_cfg())
+    assert router._pause_target_ceiling is None
+    await router._pause_until_safe({1: 1000, 2: 2000})
+    # Biggest worker's ceiling, not the average -- a paused program can
+    # resume onto whichever worker BFD picks.
+    assert router._pause_target_ceiling == 2000 * 0.80
+
+
 # ---- resume: default smallest-first, value-ordered opt-in ------------------
 
 

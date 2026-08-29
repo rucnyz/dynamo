@@ -44,6 +44,7 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
     aginfer_holder_weight: float = 1.0
     aginfer_value_ordered_resume: bool = False
     aginfer_victim_size_weight: float = 0.0
+    aginfer_victim_recoverability_weight: float = 0.0
 
     def to_thunderagent_config(self) -> ThunderAgentConfig:
         return ThunderAgentConfig(
@@ -61,6 +62,7 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             state_url=self.aginfer_state_url,
             value_ordered_resume=self.aginfer_value_ordered_resume,
             victim_size_weight=self.aginfer_victim_size_weight,
+            victim_recoverability_weight=self.aginfer_victim_recoverability_weight,
         )
 
     def validate(self) -> None:  # type: ignore[override]
@@ -85,6 +87,8 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             raise ValueError("--aginfer-holder-weight must be >= 0")
         if self.aginfer_victim_size_weight < 0:
             raise ValueError("--aginfer-victim-size-weight must be >= 0")
+        if self.aginfer_victim_recoverability_weight < 0:
+            raise ValueError("--aginfer-victim-recoverability-weight must be >= 0")
 
 
 class ThunderAgentArgGroup(ArgGroup):
@@ -271,6 +275,22 @@ class ThunderAgentArgGroup(ArgGroup):
             "because the engine scores large working sets most negative and a "
             "large victim does not fit back under the resume ceiling; a large w "
             "approaches the size-ordered baseline (default: 0.0).",
+            arg_type=float,
+        )
+        add_argument(
+            vg,
+            flag_name="--aginfer-victim-recoverability-weight",
+            env_var="DYN_AGINFER_VICTIM_RECOVERABILITY_WEIGHT",
+            default=0.0,
+            help="How much a pause victim's excess over the resume ceiling "
+            "counts against picking it, on top of --aginfer-victim-size-weight: "
+            "the key gains + w * recoverability_rank, where recoverability = "
+            "max(0, tokens - pause_target * worker_capacity) / (pause_target * "
+            "worker_capacity). Unlike the size-rank term, this compares against "
+            "the actual admission ceiling rather than whoever else is in the "
+            "table, so it does not penalise a victim that merely happens to be "
+            "the biggest program present but still fits back comfortably "
+            "(default: 0.0).",
             arg_type=float,
         )
         add_negatable_bool_argument(

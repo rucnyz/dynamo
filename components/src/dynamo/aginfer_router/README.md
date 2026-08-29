@@ -76,6 +76,29 @@ and here that cancellation is the common case rather than a corner, precisely
 because the engine's scores are anti-correlated with size. Sweep either side
 of 1.
 
+### Size-rank is relative; recoverability is absolute
+
+`size_rank` only compares a candidate against whoever else happens to be in
+the table right now — so if every ACTING program is oversized (a real state
+under sustained overload), size-rank still spreads them 0..1 and hides that
+*none* of them fit back. `--aginfer-victim-recoverability-weight w2` adds a
+second, additive term that compares against the actual ceiling
+`_greedy_resume`'s BFD pass admits against instead of the rest of the table:
+
+```text
+recoverability(u) = max(0, token_total(u) - pause_target * worker_capacity)
+                     / (pause_target * worker_capacity)
+
+victim key = value_rank + w1 * size_rank + w2 * recoverability_rank
+```
+
+A program safely under the ceiling scores `0` regardless of how it compares
+to its neighbours; only a program that structurally cannot be resumed (its
+own size alone would blow the ceiling) is penalised, and by how much it
+blows it, not by its rank among other victims. `w2 = 0` (the default) leaves
+`victim_size_weight`'s behaviour exactly as documented above; the two weights
+are independent and additive, so a workload can lean on either or both.
+
 ## Where `V_u` comes from
 
 Best signal available wins, per program:
@@ -129,6 +152,7 @@ python -m dynamo.aginfer_router \
     [--aginfer-state-url http://127.0.0.1:30000/aginfer/state] \
     [--aginfer-holder-weight 1.0] \
     [--aginfer-victim-size-weight 0.0] \
+    [--aginfer-victim-recoverability-weight 0.0] \
     [--aginfer-value-ordered-resume]
 ```
 

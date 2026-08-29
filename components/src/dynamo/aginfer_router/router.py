@@ -111,6 +111,14 @@ class ThunderAgentConfig:
     #: value. 0 is pure value; large approaches the size-ordered baseline.
     #: See ``_pause_victim_key`` for why pure value strands its own victims.
     victim_size_weight: float = 0.0
+    #: How much a victim's excess over the resume ceiling counts against
+    #: picking it, on top of ``victim_size_weight``. 0 disables the term.
+    #: Unlike the size-rank term (which only compares a victim against
+    #: whoever else happens to be in the table), this compares against the
+    #: actual admission ceiling, so it does not fire on a victim that is
+    #: merely the biggest program present but still fits comfortably -- see
+    #: ``_recoverability_penalty``.
+    victim_recoverability_weight: float = 0.0
 
 
 def _normalised_ranks(
@@ -172,7 +180,11 @@ class ThunderAgentScheduler:
         # changes shape.
         self._scores_generation = 0
         self._victim_keys: dict[str, float] = {}
-        self._victim_keys_signature: Optional[tuple[int, int, int, int]] = None
+        self._victim_keys_signature: Optional[tuple[int, int, int, int, float]] = None
+        # The resume ceiling BFD actually admits against (see
+        # _recoverability_penalty); refreshed every tick from live capacity,
+        # None until the first tick sees a non-empty snapshot.
+        self._pause_target_ceiling: Optional[float] = None
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -667,6 +679,13 @@ class ThunderAgentScheduler:
     async def _pause_until_safe(self, capacities: dict[int, int]) -> None:
         threshold = self._cfg.pause_threshold
         pause_target = min(self._cfg.pause_target, threshold)
+        # The biggest worker's target ceiling, not the average: a paused
+        # program can resume onto whichever worker BFD picks, so the relevant
+        # question is whether ANY worker could ever fit it back, not a
+        # particular one. Recomputed every call (real ticks and the direct
+        # test calls both keep it fresh) -- see _recoverability_penalty.
+        if capacities:
+            self._pause_target_ceiling = max(capacities.values()) * pause_target
 
         for worker_id, capacity in capacities.items():
             # Hold the lock for the entire per-worker decision so the snapshot
@@ -747,34 +766,72 @@ class ThunderAgentScheduler:
         negative, so value is anti-correlated with size by construction.
         Sweep either side of 1.
         """
-        if self._cfg.victim_size_weight <= 0.0:
+        if (
+            self._cfg.victim_size_weight <= 0.0
+            and self._cfg.victim_recoverability_weight <= 0.0
+        ):
             return self._program_value(program)
         blended = self._blended_victim_keys().get(program.program_id)
         # A program not yet in the table (or a single-program table) has no
         # rank to speak of; value alone still orders it consistently.
         return self._program_value(program) if blended is None else blended
 
-    def _blended_victim_keys(self) -> dict[str, float]:
-        """Per-program ``value_rank + w * size_rank``, recomputed when stale.
+    def _recoverability_penalty(self, program: Program) -> float:
+        """How far this program's size exceeds the resume ceiling itself.
 
-        Memoised because the key is asked for pairwise -- once per candidate
-        per comparison -- and a rank needs the whole table, which would
-        otherwise be re-sorted on every request.
+        ``victim_size_weight``'s size-rank only compares a victim against
+        whoever else happens to be paused-eligible right now, which says
+        nothing about whether it can be resumed AT ALL: if every candidate in
+        the table is oversized, size-rank still spreads them 0..1 and hides
+        that none of them fit. This compares against
+        ``pause_target * worker_capacity`` instead -- the actual ceiling
+        ``_greedy_resume``'s BFD admits against -- so a victim already bigger
+        than that ceiling scores unrecoverable regardless of who else is in
+        the table, and a victim safely under it scores zero regardless of how
+        it compares to its neighbours.
+
+        Returns 0.0 (no penalty) before the first tick has seen a capacity
+        snapshot, so the term degrades gracefully rather than dividing by an
+        unknown ceiling.
+        """
+        ceiling = self._pause_target_ceiling
+        if not ceiling or ceiling <= 0.0:
+            return 0.0
+        return max(0.0, float(program.token_total) - ceiling) / ceiling
+
+    def _blended_victim_keys(self) -> dict[str, float]:
+        """Per-program ``value_rank + w1 * size_rank + w2 * recoverability_rank``.
+
+        Recomputed when stale. Memoised because the key is asked for pairwise
+        -- once per candidate per comparison -- and a rank needs the whole
+        table, which would otherwise be re-sorted on every request.
         """
         signature = (
             len(self._table.programs),
             sum(p.token_total for p in self._table.programs.values()),
             sum(p.step_count for p in self._table.programs.values()),
             self._scores_generation,
+            round(self._pause_target_ceiling or 0.0, 3),
         )
         if signature != self._victim_keys_signature:
             programs = list(self._table.programs.values())
             value_rank = _normalised_ranks(programs, self._program_value)
-            size_rank = _normalised_ranks(programs, lambda p: float(p.token_total))
-            weight = self._cfg.victim_size_weight
-            self._victim_keys = {
-                pid: value_rank[pid] + weight * size_rank[pid] for pid in value_rank
-            }
+            size_weight = self._cfg.victim_size_weight
+            keys = dict(value_rank)
+            if size_weight > 0.0:
+                size_rank = _normalised_ranks(
+                    programs, lambda p: float(p.token_total)
+                )
+                for pid in keys:
+                    keys[pid] += size_weight * size_rank[pid]
+            recover_weight = self._cfg.victim_recoverability_weight
+            if recover_weight > 0.0:
+                recover_rank = _normalised_ranks(
+                    programs, self._recoverability_penalty
+                )
+                for pid in keys:
+                    keys[pid] += recover_weight * recover_rank[pid]
+            self._victim_keys = keys
             self._victim_keys_signature = signature
         return self._victim_keys
 
