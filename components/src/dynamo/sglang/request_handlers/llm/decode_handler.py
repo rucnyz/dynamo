@@ -314,6 +314,40 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             k: v for k, v in param_mapping.items() if v is not None or k in keep_if_none
         }
 
+    def _forward_aginfer_events(self, request: Dict[str, Any]) -> None:
+        """P2b (EXP_PLAN.md): forward ``extra_args.aginfer_events`` (agentreplay's
+        lifecycle events -- TOOL_CALL_START/END, SUB_DISPATCH_BLOCKING/ASYNC,
+        SUB_RETURN, see ``agentreplay.driver._emit``) to sglang's in-engine
+        belief tracker via the ``update_aginfer_events`` RPC.
+
+        Fire-and-forget: scheduled as a background task rather than awaited
+        inline, so a slow/failing engine RPC never delays the generate call it
+        rides on. Absent key, empty list, non-RL builds (no
+        ``tokenizer_manager.update_aginfer_events``), and any RPC exception are
+        all silently swallowed -- this is best-effort observability, never a
+        generation-path dependency.
+        """
+        extra_args = request.get("extra_args")
+        events = extra_args.get("aginfer_events") if isinstance(extra_args, dict) else None
+        if not events:
+            return
+        update_fn = getattr(self.engine.tokenizer_manager, "update_aginfer_events", None)
+        if update_fn is None:
+            return
+
+        async def _push() -> None:
+            try:
+                from sglang.srt.managers.io_struct import UpdateAginferEventsReq
+
+                await update_fn(UpdateAginferEventsReq(events=events))
+            except Exception:  # noqa: BLE001 — best-effort; must never surface
+                logging.debug(
+                    "aginfer: update_aginfer_events push failed (ignored)",
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_push())
+
     @staticmethod
     def _build_logprob_kwargs(request: Dict[str, Any]) -> Dict[str, Any]:
         return _shared_logprobs.build_sglang_logprob_kwargs(
@@ -350,6 +384,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         logging.debug(f"New Request ID: {context.id()}")
         trace_id = context.trace_id
+        self._forward_aginfer_events(request)
         sampling_params = self._build_sampling_params(request)
         input_param = self._get_input_param(request)
         priority = (request.get("routing") or {}).get("priority")

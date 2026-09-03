@@ -451,6 +451,84 @@ async def test_prefill_path_forwards_agent_session_as_program_id():
     assert engine.calls[0]["program_id"] == "session-1"
 
 
+@pytest.mark.asyncio
+async def test_forward_aginfer_events_calls_update_aginfer_events():
+    """P2b: extra_args.aginfer_events must reach
+    tokenizer_manager.update_aginfer_events, wrapped in an
+    UpdateAginferEventsReq (the shape scheduler.py's RPC dispatch expects)."""
+    from sglang.srt.managers.io_struct import UpdateAginferEventsReq
+
+    calls = []
+
+    class TokenizerManager:
+        async def update_aginfer_events(self, req):
+            calls.append(req)
+            return [SimpleNamespace(ok=True, applied=1, skipped=0)]
+
+    handler = _new_decode_handler()
+    handler.engine = SimpleNamespace(tokenizer_manager=TokenizerManager())
+
+    events = [{"kind": "tool_call_start", "session": "p1", "payload": {}}]
+    handler._forward_aginfer_events({"extra_args": {"aginfer_events": events}})
+    # fire-and-forget: give the scheduled task a turn to run.
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0)
+
+    assert len(calls) == 1
+    assert isinstance(calls[0], UpdateAginferEventsReq)
+    assert calls[0].events == events
+
+
+@pytest.mark.asyncio
+async def test_forward_aginfer_events_noop_without_events_or_rpc():
+    """No extra_args.aginfer_events, or a non-RL engine that lacks the RPC
+    method entirely -> no task scheduled, no AttributeError."""
+    calls = []
+
+    class TokenizerManager:
+        async def update_aginfer_events(self, req):
+            calls.append(req)
+
+    handler = _new_decode_handler()
+    handler.engine = SimpleNamespace(tokenizer_manager=TokenizerManager())
+
+    handler._forward_aginfer_events({})
+    handler._forward_aginfer_events({"extra_args": {}})
+    handler._forward_aginfer_events({"extra_args": {"aginfer_events": []}})
+
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0)
+    assert calls == []
+
+    # Non-RL engine: tokenizer_manager has no update_aginfer_events at all.
+    handler.engine = SimpleNamespace(tokenizer_manager=SimpleNamespace())
+    handler._forward_aginfer_events(
+        {"extra_args": {"aginfer_events": [{"kind": "x", "session": "p1"}]}}
+    )  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_forward_aginfer_events_swallows_rpc_failure():
+    """A failing engine RPC must never surface -- generation must not depend
+    on this best-effort push succeeding."""
+
+    class TokenizerManager:
+        async def update_aginfer_events(self, req):
+            raise RuntimeError("engine RPC failed")
+
+    handler = _new_decode_handler()
+    handler.engine = SimpleNamespace(tokenizer_manager=TokenizerManager())
+
+    handler._forward_aginfer_events(
+        {"extra_args": {"aginfer_events": [{"kind": "tool_call_end", "session": "p1"}]}}
+    )
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0)  # let the background task run (and fail) without raising
+
+
 def test_build_sampling_params_passes_n_for_token_requests():
     handler = _new_decode_handler(use_sglang_tokenizer=False)
 
