@@ -157,12 +157,22 @@ async def register_remote_model(
         config,
         kv_event_publishing_enabled=kv_event_publishing_enabled,
     )
+    # Routers' capacity providers (e.g. thunderagent_router.capacity,
+    # aginfer_router.capacity) read the MDC's top-level
+    # ``kv_cache_block_size`` field -- separate from ``runtime.total_kv_blocks``
+    # inside runtime_config -- and multiply the two to get the worker's real
+    # token budget. Leaving this unset lets it fall back to whatever default
+    # register_model() picks (observed: 16, vs. this remote sglang's real
+    # page_size of e.g. 256), silently shrinking the advertised budget by the
+    # same factor and pausing/queuing requests that would otherwise fit.
+    page_size = _as_int(server_info.get("page_size")) or 1
     await register_model(
         ModelInput.Tokens,
         ModelType.Chat | ModelType.Completions,
         generate_endpoint,
         config.model_path,
         config.served_model_name,
+        kv_cache_block_size=page_size,
         runtime_config=runtime,
         worker_type=WorkerType.Aggregated,
     )

@@ -337,3 +337,45 @@ def test_build_runtime_config_and_kv_plan():
         disable_kv_events=True,
     )
     assert resolve_kv_zmq_plan(info, cfg2) is None
+
+
+def test_register_remote_model_passes_kv_cache_block_size(monkeypatch):
+    """Regression: routers' capacity providers (thunderagent_router /
+    aginfer_router capacity.py) read the MDC's top-level
+    ``kv_cache_block_size`` -- a separate register_model() kwarg from
+    ``runtime_config.total_kv_blocks`` -- and multiply the two for the real
+    token budget. Omitting it silently falls back to a wrong default,
+    shrinking the advertised budget and mis-pausing/queuing requests that
+    would otherwise fit (observed live: 16 vs. the real page_size of 256,
+    a 16x under-count of the true SGLang KV cache capacity)."""
+    from dynamo.sglang_remote import register as register_mod
+
+    captured: Dict[str, Any] = {}
+
+    async def _fake_register_model(*args, **kwargs):
+        captured.update(kwargs)
+        captured["positional"] = args
+        return None
+
+    monkeypatch.setattr(register_mod, "register_model", _fake_register_model)
+
+    info = {
+        "page_size": 256,
+        "max_total_num_tokens": 249856,
+        "context_length": 131072,
+        "max_running_requests": 24,
+        "dp_size": 1,
+    }
+    cfg = RemoteConfig(sglang_url="http://127.0.0.1:30000", model_path="/m")
+
+    asyncio.run(
+        register_mod.register_remote_model(
+            generate_endpoint=object(),
+            config=cfg,
+            server_info=info,
+            kv_event_publishing_enabled=False,
+        )
+    )
+
+    assert captured["kv_cache_block_size"] == 256
+    assert captured["runtime_config"].total_kv_blocks == 249856 // 256
