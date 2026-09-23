@@ -20,7 +20,21 @@ export interface DynamoEvent {
   addUrl: string;
 }
 
-export const UPCOMING_EVENTS: DynamoEvent[] = [];
+export const UPCOMING_EVENTS: DynamoEvent[] = [
+  {
+    "title": "Dynamo community meeting",
+    "start": "2026-09-23T17:30:00.000Z",
+    "month": "Sep",
+    "day": "23",
+    "year": "2026",
+    "dateLabel": "Wed, Sep 23, 2026",
+    "timeLabel": "10:30 AM",
+    "isPast": false,
+    "location": "Online",
+    "locationUrl": "https://meet.google.com/heb-demu-qok",
+    "addUrl": "https://calendar.google.com/calendar/render?action=TEMPLATE&text=Dynamo+community+meeting&dates=20260923T173000Z%2F20260923T181500Z&location=https%3A%2F%2Fmeet.google.com%2Fheb-demu-qok"
+  }
+];
 
 export const PAST_EVENTS: DynamoEvent[] = [
   {
